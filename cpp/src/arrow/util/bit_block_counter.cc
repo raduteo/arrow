@@ -29,9 +29,6 @@
 namespace arrow {
 namespace internal {
 
-static constexpr int64_t kWordBits = 64;
-static constexpr int64_t kFourWordsBits = 256;
-
 static inline uint64_t LoadWord(const uint8_t* bytes) {
   return BitUtil::ToLittleEndian(util::SafeLoadAs<uint64_t>(bytes));
 }
@@ -116,10 +113,10 @@ BitBlockCount BitBlockCounter::NextFourWords() {
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(const uint8_t* validity_bitmap,
                                                  int64_t offset, int64_t length)
-    : counter_(validity_bitmap, offset, length),
+    : has_bitmap_(validity_bitmap != nullptr),
       position_(0),
       length_(length),
-      has_bitmap_(validity_bitmap != nullptr) {}
+      counter_(validity_bitmap, offset, length) {}
 
 OptionalBitBlockCounter::OptionalBitBlockCounter(
     const std::shared_ptr<Buffer>& validity_bitmap, int64_t offset, int64_t length)
@@ -133,6 +130,7 @@ BitBlockCount BinaryBitBlockCounter::NextWord() {
   }
   // When the offset is > 0, we need there to be a word beyond the last aligned
   // word in the bitmap for the bit shifting logic.
+  constexpr int64_t kWordBits = BitBlockCounter::kWordBits;
   const int64_t bits_required_to_use_words =
       std::max(left_offset_ == 0 ? 64 : 64 + (64 - left_offset_),
                right_offset_ == 0 ? 64 : 64 + (64 - right_offset_));
@@ -181,6 +179,25 @@ BitBlockCount BinaryBitBlockCounter::NextOrWord() {
 BitBlockCount BinaryBitBlockCounter::NextOrNotWord() {
   return NextWord<detail::BitBlockOrNot>();
 }
+
+OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(const uint8_t* left_bitmap,
+                                                             int64_t left_offset,
+                                                             const uint8_t* right_bitmap,
+                                                             int64_t right_offset,
+                                                             int64_t length)
+    : has_bitmap_(HasBitmapFromBitmaps(left_bitmap != nullptr, right_bitmap != nullptr)),
+      position_(0),
+      length_(length),
+      unary_counter_(left_bitmap != nullptr ? left_bitmap : right_bitmap,
+                     left_bitmap != nullptr ? left_offset : right_offset, length),
+      binary_counter_(left_bitmap, left_offset, right_bitmap, right_offset, length) {}
+
+OptionalBinaryBitBlockCounter::OptionalBinaryBitBlockCounter(
+    const std::shared_ptr<Buffer>& left_bitmap, int64_t left_offset,
+    const std::shared_ptr<Buffer>& right_bitmap, int64_t right_offset, int64_t length)
+    : OptionalBinaryBitBlockCounter(
+          left_bitmap ? left_bitmap->data() : nullptr, left_offset,
+          right_bitmap ? right_bitmap->data() : nullptr, right_offset, length) {}
 
 }  // namespace internal
 }  // namespace arrow

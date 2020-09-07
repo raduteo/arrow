@@ -113,6 +113,55 @@ TEST_F(TestArray, TestLength) {
   ASSERT_EQ(arr->length(), 100);
 }
 
+TEST_F(TestArray, TestSliceSafe) {
+  std::vector<int32_t> original_data{1, 2, 3, 4, 5, 6, 7};
+  auto arr = std::make_shared<Int32Array>(7, Buffer::Wrap(original_data));
+
+  auto check_data = [](const Array& arr, const std::vector<int32_t>& expected) {
+    ASSERT_EQ(arr.length(), static_cast<int64_t>(expected.size()));
+    const int32_t* data = arr.data()->GetValues<int32_t>(1);
+    for (int64_t i = 0; i < arr.length(); ++i) {
+      ASSERT_EQ(data[i], expected[i]);
+    }
+  };
+
+  check_data(*arr, {1, 2, 3, 4, 5, 6, 7});
+
+  ASSERT_OK_AND_ASSIGN(auto sliced, arr->SliceSafe(0, 0));
+  check_data(*sliced, {});
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(0, 7));
+  check_data(*sliced, original_data);
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(3, 4));
+  check_data(*sliced, {4, 5, 6, 7});
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(0, 7));
+  check_data(*sliced, {1, 2, 3, 4, 5, 6, 7});
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(7, 0));
+  check_data(*sliced, {});
+
+  ASSERT_RAISES(Invalid, arr->SliceSafe(8, 0));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(0, 8));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(-1, 0));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(0, -1));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(6, 2));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(6, std::numeric_limits<int64_t>::max() - 5));
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(0));
+  check_data(*sliced, original_data);
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(3));
+  check_data(*sliced, {4, 5, 6, 7});
+
+  ASSERT_OK_AND_ASSIGN(sliced, arr->SliceSafe(7));
+  check_data(*sliced, {});
+
+  ASSERT_RAISES(Invalid, arr->SliceSafe(8));
+  ASSERT_RAISES(Invalid, arr->SliceSafe(-1));
+}
+
 Status MakeArrayFromValidBytes(const std::vector<uint8_t>& v, MemoryPool* pool,
                                std::shared_ptr<Array>* out) {
   int64_t null_count = v.size() - std::accumulate(v.begin(), v.end(), 0);
@@ -184,6 +233,9 @@ TEST_F(TestArray, SliceRecomputeNullCount) {
 
   slice = array->Slice(4);
   ASSERT_EQ(4, slice->null_count());
+
+  auto slice2 = slice->Slice(0);
+  ASSERT_EQ(4, slice2->null_count());
 
   slice = array->Slice(0);
   ASSERT_EQ(5, slice->null_count());
@@ -290,7 +342,6 @@ TEST_F(TestArray, TestMakeArrayOfNull) {
       decimal(16, 4),
       utf8(),
       large_utf8(),
-
       list(utf8()),
       list(int64()),  // ARROW-9071
       large_list(large_utf8()),
@@ -298,8 +349,6 @@ TEST_F(TestArray, TestMakeArrayOfNull) {
       fixed_size_list(int64(), 4),
       dictionary(int32(), utf8()),
       struct_({field("a", utf8()), field("b", int32())}),
-      sparse_union({field("a", utf8()), field("b", int32())}, {0, 1}),
-      dense_union({field("a", utf8()), field("b", int32())}, {0, 1}),
       // clang-format on
   };
 
@@ -313,27 +362,83 @@ TEST_F(TestArray, TestMakeArrayOfNull) {
   }
 }
 
+TEST_F(TestArray, TestMakeArrayOfNullUnion) {
+  // Unions need special checking -- the top level null count is 0 (per
+  // ARROW-9222) so we check the first child to make sure is contains all nulls
+  // and check that the type_ids all point to the first child
+  const int64_t union_length = 10;
+  auto s_union_ty = sparse_union({field("a", utf8()), field("b", int32())}, {0, 1});
+  ASSERT_OK_AND_ASSIGN(auto s_union_nulls, MakeArrayOfNull(s_union_ty, union_length));
+  ASSERT_EQ(s_union_nulls->null_count(), 0);
+  {
+    const auto& typed_union = checked_cast<const SparseUnionArray&>(*s_union_nulls);
+    ASSERT_EQ(typed_union.field(0)->null_count(), union_length);
+
+    // Check type codes are all 0
+    for (int i = 0; i < union_length; ++i) {
+      ASSERT_EQ(typed_union.raw_type_codes()[i], 0);
+    }
+  }
+
+  auto d_union_ty = dense_union({field("a", utf8()), field("b", int32())}, {0, 1});
+  ASSERT_OK_AND_ASSIGN(auto d_union_nulls, MakeArrayOfNull(d_union_ty, union_length));
+  ASSERT_EQ(d_union_nulls->null_count(), 0);
+  {
+    const auto& typed_union = checked_cast<const DenseUnionArray&>(*d_union_nulls);
+
+    // Child field has length 1 which is a null element
+    ASSERT_EQ(typed_union.field(0)->length(), 1);
+    ASSERT_EQ(typed_union.field(0)->null_count(), 1);
+
+    // Check type codes are all 0 and the offsets point to the first element of
+    // the first child
+    for (int i = 0; i < union_length; ++i) {
+      ASSERT_EQ(typed_union.raw_type_codes()[i], 0);
+      ASSERT_EQ(typed_union.raw_value_offsets()[i], 0);
+    }
+  }
+}
+
 TEST_F(TestArray, TestMakeArrayFromScalar) {
+  ASSERT_OK_AND_ASSIGN(auto null_array, MakeArrayFromScalar(NullScalar(), 5));
+  ASSERT_OK(null_array->ValidateFull());
+  ASSERT_EQ(null_array->length(), 5);
+  ASSERT_EQ(null_array->null_count(), 5);
+
   auto hello = Buffer::FromString("hello");
-  ScalarVector scalars{std::make_shared<BooleanScalar>(false),
-                       std::make_shared<Int8Scalar>(3),
-                       std::make_shared<UInt16Scalar>(3),
-                       std::make_shared<Int32Scalar>(3),
-                       std::make_shared<UInt64Scalar>(3),
-                       std::make_shared<DoubleScalar>(3.0),
-                       std::make_shared<BinaryScalar>(hello),
-                       std::make_shared<LargeBinaryScalar>(hello),
-                       std::make_shared<FixedSizeBinaryScalar>(
-                           hello, fixed_size_binary(static_cast<int32_t>(hello->size()))),
-                       std::make_shared<Decimal128Scalar>(Decimal128(10), decimal(16, 4)),
-                       std::make_shared<StringScalar>(hello),
-                       std::make_shared<LargeStringScalar>(hello),
-                       std::make_shared<StructScalar>(
-                           ScalarVector{
-                               std::make_shared<Int32Scalar>(2),
-                               std::make_shared<Int32Scalar>(6),
-                           },
-                           struct_({field("min", int32()), field("max", int32())}))};
+  DayTimeIntervalType::DayMilliseconds daytime{1, 100};
+
+  ScalarVector scalars{
+      std::make_shared<BooleanScalar>(false),
+      std::make_shared<Int8Scalar>(3),
+      std::make_shared<UInt16Scalar>(3),
+      std::make_shared<Int32Scalar>(3),
+      std::make_shared<UInt64Scalar>(3),
+      std::make_shared<DoubleScalar>(3.0),
+      std::make_shared<Date32Scalar>(10),
+      std::make_shared<Date64Scalar>(11),
+      std::make_shared<Time32Scalar>(1000, time32(TimeUnit::SECOND)),
+      std::make_shared<Time64Scalar>(1111, time64(TimeUnit::MICRO)),
+      std::make_shared<TimestampScalar>(1111, timestamp(TimeUnit::MILLI)),
+      std::make_shared<MonthIntervalScalar>(1),
+      std::make_shared<DayTimeIntervalScalar>(daytime),
+      std::make_shared<DurationScalar>(60, duration(TimeUnit::SECOND)),
+      std::make_shared<BinaryScalar>(hello),
+      std::make_shared<LargeBinaryScalar>(hello),
+      std::make_shared<FixedSizeBinaryScalar>(
+          hello, fixed_size_binary(static_cast<int32_t>(hello->size()))),
+      std::make_shared<Decimal128Scalar>(Decimal128(10), decimal(16, 4)),
+      std::make_shared<StringScalar>(hello),
+      std::make_shared<LargeStringScalar>(hello),
+      std::make_shared<ListScalar>(ArrayFromJSON(int8(), "[1, 2, 3]")),
+      std::make_shared<LargeListScalar>(ArrayFromJSON(int8(), "[1, 1, 2, 2, 3, 3]")),
+      std::make_shared<FixedSizeListScalar>(ArrayFromJSON(int8(), "[1, 2, 3, 4]")),
+      std::make_shared<StructScalar>(
+          ScalarVector{
+              std::make_shared<Int32Scalar>(2),
+              std::make_shared<Int32Scalar>(6),
+          },
+          struct_({field("min", int32()), field("max", int32())}))};
 
   for (int64_t length : {16}) {
     for (auto scalar : scalars) {
@@ -342,6 +447,40 @@ TEST_F(TestArray, TestMakeArrayFromScalar) {
       ASSERT_EQ(array->length(), length);
       ASSERT_EQ(array->null_count(), 0);
     }
+  }
+}
+
+TEST_F(TestArray, TestMakeArrayFromDictionaryScalar) {
+  auto dictionary = ArrayFromJSON(utf8(), R"(["foo", "bar", "baz"])");
+  auto type = std::make_shared<DictionaryType>(int8(), utf8());
+  ASSERT_OK_AND_ASSIGN(auto value, MakeScalar(int8(), 1));
+  auto scalar = DictionaryScalar({value, dictionary}, type);
+
+  ASSERT_OK_AND_ASSIGN(auto array, MakeArrayFromScalar(scalar, 4));
+  ASSERT_OK(array->ValidateFull());
+  ASSERT_EQ(array->length(), 4);
+  ASSERT_EQ(array->null_count(), 0);
+
+  for (int i = 0; i < 4; i++) {
+    ASSERT_OK_AND_ASSIGN(auto item, array->GetScalar(i));
+    ASSERT_TRUE(item->Equals(scalar));
+  }
+}
+
+TEST_F(TestArray, TestMakeArrayFromMapScalar) {
+  auto value =
+      ArrayFromJSON(struct_({field("key", utf8(), false), field("value", int8())}),
+                    R"([{"key": "a", "value": 1}, {"key": "b", "value": 2}])");
+  auto scalar = MapScalar(value);
+
+  ASSERT_OK_AND_ASSIGN(auto array, MakeArrayFromScalar(scalar, 11));
+  ASSERT_OK(array->ValidateFull());
+  ASSERT_EQ(array->length(), 11);
+  ASSERT_EQ(array->null_count(), 0);
+
+  for (int i = 0; i < 11; i++) {
+    ASSERT_OK_AND_ASSIGN(auto item, array->GetScalar(i));
+    ASSERT_TRUE(item->Equals(scalar));
   }
 }
 
@@ -407,6 +546,7 @@ TEST(TestNullBuilder, Basics) {
   ASSERT_OK(builder.Append(nullptr));
   ASSERT_OK(builder.AppendNull());
   ASSERT_OK(builder.AppendNulls(2));
+  ASSERT_EQ(5, builder.null_count());
   ASSERT_OK(builder.Finish(&array));
 
   const auto& null_array = checked_cast<NullArray&>(*array);
@@ -738,6 +878,7 @@ TYPED_TEST(TestPrimitiveBuilder, TestAppendNull) {
   int64_t size = 1000;
   for (int64_t i = 0; i < size; ++i) {
     ASSERT_OK(this->builder_->AppendNull());
+    ASSERT_EQ(i + 1, this->builder_->null_count());
   }
 
   std::shared_ptr<Array> out;
@@ -759,6 +900,7 @@ TYPED_TEST(TestPrimitiveBuilder, TestAppendNull) {
 TYPED_TEST(TestPrimitiveBuilder, TestAppendNulls) {
   const int64_t size = 10;
   ASSERT_OK(this->builder_->AppendNulls(size));
+  ASSERT_EQ(size, this->builder_->null_count());
 
   std::shared_ptr<Array> result;
   FinishAndCheckPadding(this->builder_.get(), &result);
@@ -1362,7 +1504,7 @@ void CheckFloatingNanEquality() {
 
   // NaN != non-NaN
   ArrayFromVector<TYPE>(type, {false, true}, {0.5, nan_value}, &a);
-  ArrayFromVector<TYPE>(type, {false, true}, {0.5, 0.0}, &a);
+  ArrayFromVector<TYPE>(type, {false, true}, {0.5, 0.0}, &b);
   ASSERT_FALSE(a->Equals(b));
   ASSERT_FALSE(b->Equals(a));
   ASSERT_FALSE(a->Equals(b, EqualOptions().nans_equal(true)));
@@ -1381,6 +1523,73 @@ void CheckFloatingNanEquality() {
   ASSERT_TRUE(b->RangeEquals(a, 0, 1, 0));
 }
 
+template <typename TYPE>
+void CheckFloatingInfinityEquality() {
+  std::shared_ptr<Array> a, b;
+  std::shared_ptr<DataType> type = TypeTraits<TYPE>::type_singleton();
+
+  const auto infinity = std::numeric_limits<typename TYPE::c_type>::infinity();
+
+  for (auto nans_equal : {false, true}) {
+    // Infinity in a null entry
+    ArrayFromVector<TYPE>(type, {true, false}, {0.5, infinity}, &a);
+    ArrayFromVector<TYPE>(type, {true, false}, {0.5, -infinity}, &b);
+    ASSERT_TRUE(a->Equals(b));
+    ASSERT_TRUE(b->Equals(a));
+    ASSERT_TRUE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_TRUE(b->ApproxEquals(a, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_TRUE(a->RangeEquals(b, 0, 2, 0));
+    ASSERT_TRUE(b->RangeEquals(a, 0, 2, 0));
+    ASSERT_TRUE(a->RangeEquals(b, 1, 2, 1));
+    ASSERT_TRUE(b->RangeEquals(a, 1, 2, 1));
+
+    // Infinity in a valid entry
+    ArrayFromVector<TYPE>(type, {false, true}, {0.5, infinity}, &a);
+    ArrayFromVector<TYPE>(type, {false, true}, {0.5, infinity}, &b);
+    ASSERT_TRUE(a->Equals(b));
+    ASSERT_TRUE(b->Equals(a));
+    ASSERT_TRUE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_TRUE(b->ApproxEquals(a, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_TRUE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_TRUE(b->ApproxEquals(a, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    // Infinity in tested range
+    ASSERT_TRUE(a->RangeEquals(b, 0, 2, 0));
+    ASSERT_TRUE(b->RangeEquals(a, 0, 2, 0));
+    ASSERT_TRUE(a->RangeEquals(b, 1, 2, 1));
+    ASSERT_TRUE(b->RangeEquals(a, 1, 2, 1));
+    // Infinity not in tested range
+    ASSERT_TRUE(a->RangeEquals(b, 0, 1, 0));
+    ASSERT_TRUE(b->RangeEquals(a, 0, 1, 0));
+
+    // Infinity != non-infinity
+    ArrayFromVector<TYPE>(type, {false, true}, {0.5, -infinity}, &a);
+    ArrayFromVector<TYPE>(type, {false, true}, {0.5, 0.0}, &b);
+    ASSERT_FALSE(a->Equals(b));
+    ASSERT_FALSE(b->Equals(a));
+    ASSERT_FALSE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_FALSE(b->ApproxEquals(a));
+    ASSERT_FALSE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_FALSE(b->ApproxEquals(a, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    // Infinity != Negative infinity
+    ArrayFromVector<TYPE>(type, {true, true}, {0.5, -infinity}, &a);
+    ArrayFromVector<TYPE>(type, {true, true}, {0.5, infinity}, &b);
+    ASSERT_FALSE(a->Equals(b));
+    ASSERT_FALSE(b->Equals(a));
+    ASSERT_FALSE(a->ApproxEquals(b));
+    ASSERT_FALSE(b->ApproxEquals(a));
+    ASSERT_FALSE(a->ApproxEquals(b, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    ASSERT_FALSE(b->ApproxEquals(a, EqualOptions().atol(1e-5).nans_equal(nans_equal)));
+    // Infinity in tested range
+    ASSERT_FALSE(a->RangeEquals(b, 0, 2, 0));
+    ASSERT_FALSE(b->RangeEquals(a, 0, 2, 0));
+    ASSERT_FALSE(a->RangeEquals(b, 1, 2, 1));
+    ASSERT_FALSE(b->RangeEquals(a, 1, 2, 1));
+    // Infinity not in tested range
+    ASSERT_TRUE(a->RangeEquals(b, 0, 1, 0));
+    ASSERT_TRUE(b->RangeEquals(a, 0, 1, 0));
+  }
+}
+
 TEST(TestPrimitiveAdHoc, FloatingApproxEquals) {
   CheckApproxEquals<FloatType>();
   CheckApproxEquals<DoubleType>();
@@ -1394,6 +1603,11 @@ TEST(TestPrimitiveAdHoc, FloatingSliceApproxEquals) {
 TEST(TestPrimitiveAdHoc, FloatingNanEquality) {
   CheckFloatingNanEquality<FloatType>();
   CheckFloatingNanEquality<DoubleType>();
+}
+
+TEST(TestPrimitiveAdHoc, FloatingInfinityEquality) {
+  CheckFloatingInfinityEquality<FloatType>();
+  CheckFloatingInfinityEquality<DoubleType>();
 }
 
 // ----------------------------------------------------------------------
@@ -1747,6 +1961,7 @@ TEST_F(TestAdaptiveIntBuilder, TestInt16Nulls) {
   ASSERT_EQ(builder_->type()->id(), Type::INT16);
   ASSERT_OK(builder_->AppendNull());
   ASSERT_EQ(builder_->type()->id(), Type::INT16);
+  ASSERT_EQ(1, builder_->null_count());
   Done();
 
   std::vector<int16_t> expected_values({0, 128, 0});
@@ -1855,10 +2070,13 @@ TEST_F(TestAdaptiveIntBuilder, TestAssertZeroPadded) {
 TEST_F(TestAdaptiveIntBuilder, TestAppendNull) {
   int64_t size = 1000;
   ASSERT_OK(builder_->Append(127));
+  ASSERT_EQ(0, builder_->null_count());
   for (unsigned index = 1; index < size - 1; ++index) {
     ASSERT_OK(builder_->AppendNull());
+    ASSERT_EQ(index, builder_->null_count());
   }
   ASSERT_OK(builder_->Append(-128));
+  ASSERT_EQ(size - 2, builder_->null_count());
 
   Done();
 
@@ -1875,13 +2093,28 @@ TEST_F(TestAdaptiveIntBuilder, TestAppendNull) {
 
 TEST_F(TestAdaptiveIntBuilder, TestAppendNulls) {
   constexpr int64_t size = 10;
+  ASSERT_EQ(0, builder_->null_count());
   ASSERT_OK(builder_->AppendNulls(size));
+  ASSERT_EQ(size, builder_->null_count());
 
   Done();
 
   for (unsigned index = 0; index < size; ++index) {
     ASSERT_FALSE(result_->IsValid(index));
   }
+}
+
+TEST(TestAdaptiveIntBuilderWithStartIntSize, TestReset) {
+  auto builder = std::make_shared<AdaptiveIntBuilder>(
+      static_cast<uint8_t>(sizeof(int16_t)), default_memory_pool());
+  AssertTypeEqual(*int16(), *builder->type());
+
+  ASSERT_OK(
+      builder->Append(static_cast<int64_t>(std::numeric_limits<int16_t>::max()) + 1));
+  AssertTypeEqual(*int32(), *builder->type());
+
+  builder->Reset();
+  AssertTypeEqual(*int16(), *builder->type());
 }
 
 class TestAdaptiveUIntBuilder : public TestBuilder {
@@ -1971,6 +2204,7 @@ TEST_F(TestAdaptiveUIntBuilder, TestUInt16Nulls) {
   ASSERT_EQ(builder_->type()->id(), Type::UINT16);
   ASSERT_OK(builder_->AppendNull());
   ASSERT_EQ(builder_->type()->id(), Type::UINT16);
+  ASSERT_EQ(1, builder_->null_count());
   Done();
 
   std::vector<uint16_t> expected_values({0, 256, 0});
@@ -2059,6 +2293,7 @@ TEST_F(TestAdaptiveUIntBuilder, TestAppendNull) {
   ASSERT_OK(builder_->Append(254));
   for (unsigned index = 1; index < size - 1; ++index) {
     ASSERT_OK(builder_->AppendNull());
+    ASSERT_EQ(index, builder_->null_count());
   }
   ASSERT_OK(builder_->Append(255));
 
@@ -2078,12 +2313,26 @@ TEST_F(TestAdaptiveUIntBuilder, TestAppendNull) {
 TEST_F(TestAdaptiveUIntBuilder, TestAppendNulls) {
   constexpr int64_t size = 10;
   ASSERT_OK(builder_->AppendNulls(size));
+  ASSERT_EQ(size, builder_->null_count());
 
   Done();
 
   for (unsigned index = 0; index < size; ++index) {
     ASSERT_FALSE(result_->IsValid(index));
   }
+}
+
+TEST(TestAdaptiveUIntBuilderWithStartIntSize, TestReset) {
+  auto builder = std::make_shared<AdaptiveUIntBuilder>(
+      static_cast<uint8_t>(sizeof(uint16_t)), default_memory_pool());
+  AssertTypeEqual(uint16(), builder->type());
+
+  ASSERT_OK(
+      builder->Append(static_cast<uint64_t>(std::numeric_limits<uint16_t>::max()) + 1));
+  AssertTypeEqual(uint32(), builder->type());
+
+  builder->Reset();
+  AssertTypeEqual(uint16(), builder->type());
 }
 
 // ----------------------------------------------------------------------

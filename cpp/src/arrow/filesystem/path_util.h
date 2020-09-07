@@ -92,6 +92,8 @@ template <class StringIt>
 std::string JoinAbstractPath(StringIt it, StringIt end) {
   std::string path;
   for (; it != end; ++it) {
+    if (it->empty()) continue;
+
     if (!path.empty()) {
       path += kSep;
     }
@@ -113,6 +115,9 @@ std::string ToBackslashes(util::string_view s);
 /// on Windows.  Return the path unchanged on other systems.
 ARROW_EXPORT
 std::string ToSlashes(util::string_view s);
+
+ARROW_EXPORT
+bool IsEmptyPath(util::string_view s);
 
 }  // namespace internal
 }  // namespace fs

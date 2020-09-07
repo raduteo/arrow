@@ -105,16 +105,9 @@ class PlainEncoder : public EncoderImpl, virtual public TypedEncoder<DType> {
                  int64_t valid_bits_offset) override {
     PARQUET_ASSIGN_OR_THROW(
         auto buffer, arrow::AllocateBuffer(num_values * sizeof(T), this->memory_pool()));
-    int32_t num_valid_values = 0;
-    arrow::internal::BitmapReader valid_bits_reader(valid_bits, valid_bits_offset,
-                                                    num_values);
     T* data = reinterpret_cast<T*>(buffer->mutable_data());
-    for (int32_t i = 0; i < num_values; i++) {
-      if (valid_bits_reader.IsSet()) {
-        data[num_valid_values++] = src[i];
-      }
-      valid_bits_reader.Next();
-    }
+    int num_valid_values = arrow::util::internal::SpacedCompress<T>(
+        src, num_values, valid_bits, valid_bits_offset, data);
     Put(data, num_valid_values);
   }
 
@@ -305,16 +298,9 @@ class PlainEncoder<BooleanType> : public EncoderImpl, virtual public BooleanEnco
                  int64_t valid_bits_offset) override {
     PARQUET_ASSIGN_OR_THROW(
         auto buffer, arrow::AllocateBuffer(num_values * sizeof(T), this->memory_pool()));
-    int32_t num_valid_values = 0;
-    arrow::internal::BitmapReader valid_bits_reader(valid_bits, valid_bits_offset,
-                                                    num_values);
     T* data = reinterpret_cast<T*>(buffer->mutable_data());
-    for (int32_t i = 0; i < num_values; i++) {
-      if (valid_bits_reader.IsSet()) {
-        data[num_valid_values++] = src[i];
-      }
-      valid_bits_reader.Next();
-    }
+    int num_valid_values = arrow::util::internal::SpacedCompress<T>(
+        src, num_values, valid_bits, valid_bits_offset, data);
     Put(data, num_valid_values);
   }
 
@@ -542,26 +528,23 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
   void Put(const arrow::Array& values) override;
   void PutDictionary(const arrow::Array& values) override;
 
-  template <typename ArrowType>
+  template <typename ArrowType, typename T = typename ArrowType::c_type>
   void PutIndicesTyped(const arrow::Array& data) {
-    using ArrayType = typename arrow::TypeTraits<ArrowType>::ArrayType;
-    const auto& indices = checked_cast<const ArrayType&>(data);
-    auto values = indices.raw_values();
-
+    auto values = data.data()->GetValues<T>(1);
     size_t buffer_position = buffered_indices_.size();
-    buffered_indices_.resize(
-        buffer_position + static_cast<size_t>(indices.length() - indices.null_count()));
-    if (indices.null_count() > 0) {
-      arrow::internal::BitmapReader valid_bits_reader(indices.null_bitmap_data(),
-                                                      indices.offset(), indices.length());
-      for (int64_t i = 0; i < indices.length(); ++i) {
+    buffered_indices_.resize(buffer_position +
+                             static_cast<size_t>(data.length() - data.null_count()));
+    if (data.null_count() > 0) {
+      arrow::internal::BitmapReader valid_bits_reader(data.null_bitmap_data(),
+                                                      data.offset(), data.length());
+      for (int64_t i = 0; i < data.length(); ++i) {
         if (valid_bits_reader.IsSet()) {
           buffered_indices_[buffer_position++] = static_cast<int32_t>(values[i]);
         }
         valid_bits_reader.Next();
       }
     } else {
-      for (int64_t i = 0; i < indices.length(); ++i) {
+      for (int64_t i = 0; i < data.length(); ++i) {
         buffered_indices_[buffer_position++] = static_cast<int32_t>(values[i]);
       }
     }
@@ -569,16 +552,20 @@ class DictEncoderImpl : public EncoderImpl, virtual public DictEncoder<DType> {
 
   void PutIndices(const arrow::Array& data) override {
     switch (data.type()->id()) {
+      case arrow::Type::UINT8:
       case arrow::Type::INT8:
-        return PutIndicesTyped<arrow::Int8Type>(data);
+        return PutIndicesTyped<arrow::UInt8Type>(data);
+      case arrow::Type::UINT16:
       case arrow::Type::INT16:
-        return PutIndicesTyped<arrow::Int16Type>(data);
+        return PutIndicesTyped<arrow::UInt16Type>(data);
+      case arrow::Type::UINT32:
       case arrow::Type::INT32:
-        return PutIndicesTyped<arrow::Int32Type>(data);
+        return PutIndicesTyped<arrow::UInt32Type>(data);
+      case arrow::Type::UINT64:
       case arrow::Type::INT64:
-        return PutIndicesTyped<arrow::Int64Type>(data);
+        return PutIndicesTyped<arrow::UInt64Type>(data);
       default:
-        throw ParquetException("Dictionary indices were not signed integer");
+        throw ParquetException("Passed non-integer array to PutIndices");
     }
   }
 
@@ -897,16 +884,9 @@ void ByteStreamSplitEncoder<DType>::PutSpaced(const T* src, int num_values,
                                               int64_t valid_bits_offset) {
   PARQUET_ASSIGN_OR_THROW(
       auto buffer, arrow::AllocateBuffer(num_values * sizeof(T), this->memory_pool()));
-  int32_t num_valid_values = 0;
-  arrow::internal::BitmapReader valid_bits_reader(valid_bits, valid_bits_offset,
-                                                  num_values);
   T* data = reinterpret_cast<T*>(buffer->mutable_data());
-  for (int32_t i = 0; i < num_values; i++) {
-    if (valid_bits_reader.IsSet()) {
-      data[num_valid_values++] = src[i];
-    }
-    valid_bits_reader.Next();
-  }
+  int num_valid_values = arrow::util::internal::SpacedCompress<T>(
+      src, num_values, valid_bits, valid_bits_offset, data);
   Put(data, num_valid_values);
 }
 

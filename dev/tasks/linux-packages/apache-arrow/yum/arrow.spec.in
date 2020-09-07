@@ -44,7 +44,9 @@
 %define use_glib (%{_centos_ver} >= 7)
 %define use_meson (%{_centos_ver} >= 8)
 
+%define have_brotli (%{_centos_ver} >= 7)
 %define have_rapidjson (%{_centos_ver} == 7)
+%define have_re2 (%{_centos_ver} >= 8)
 %define have_utf8proc (%{_centos_ver} == 7)
 
 Name:		@PACKAGE@
@@ -59,6 +61,8 @@ Source0:	https://dist.apache.org/repos/dist/release/@PACKAGE@/@PACKAGE@-%{versio
 BuildRequires:	bison
 %if %{_centos_ver} >= 7
 BuildRequires:	boost%{boost_version}-devel
+%endif
+%if %{have_brotli}
 BuildRequires:	brotli-devel
 %endif
 BuildRequires:	bzip2-devel
@@ -79,7 +83,7 @@ BuildRequires:	python%{python_version}-numpy
 %if %{have_rapidjson}
 BuildRequires:	rapidjson-devel
 %endif
-%if %{_centos_ver} >= 8
+%if %{have_re2}
 BuildRequires:	re2-devel
 %endif
 BuildRequires:	snappy-devel
@@ -218,6 +222,8 @@ License:	Apache-2.0
 Requires:	boost%{boost_version}-system
 Requires:	boost%{boost_version}-filesystem
 Requires:	boost%{boost_version}-regex
+%endif
+%if %{have_brotli}
 Requires:	brotli
 %endif
 %if %{_centos_ver} >= 7
@@ -226,7 +232,7 @@ Requires:	glog
 %endif
 Requires:	libzstd
 Requires:	lz4
-%if %{_centos_ver} >= 8
+%if %{have_re2}
 Requires:	re2
 %endif
 Requires:	snappy
@@ -265,9 +271,19 @@ Libraries and header files for Apache Arrow C++.
 %{_libdir}/cmake/arrow/ArrowOptions.cmake
 %{_libdir}/cmake/arrow/ArrowTargets*.cmake
 %{_libdir}/cmake/arrow/FindArrow.cmake
+%if %{have_brotli}
+%{_libdir}/cmake/arrow/FindBrotli.cmake
+%endif
+%{_libdir}/cmake/arrow/FindLz4.cmake
+%{_libdir}/cmake/arrow/FindSnappy.cmake
+%if %{have_utf8proc}
+%{_libdir}/cmake/arrow/Findutf8proc.cmake
+%endif
+%{_libdir}/cmake/arrow/Findzstd.cmake
 %{_libdir}/cmake/arrow/arrow-config.cmake
 %{_libdir}/libarrow.a
 %{_libdir}/libarrow.so
+%{_libdir}/libarrow_bundled_dependencies.a
 %{_libdir}/pkgconfig/arrow-compute.pc
 %{_libdir}/pkgconfig/arrow-csv.pc
 %{_libdir}/pkgconfig/arrow-filesystem.pc
@@ -281,7 +297,7 @@ License:	Apache-2.0
 Requires:	%{name}-libs = %{version}-%{release}
 
 %description dataset-libs
-This package contains the libraries for Apache Arrow Datasets.
+This package contains the libraries for Apache Arrow dataset.
 
 %files dataset-libs
 %defattr(-,root,root,-)
@@ -289,12 +305,12 @@ This package contains the libraries for Apache Arrow Datasets.
 %{_libdir}/libarrow_dataset.so.*
 
 %package dataset-devel
-Summary:	Libraries and header files for Apache Arrow Datasets.
+Summary:	Libraries and header files for Apache Arrow dataset.
 License:	Apache-2.0
 Requires:	%{name}-dataset-libs = %{version}-%{release}
 
 %description dataset-devel
-Libraries and header files for Apache Arrow Datasets.
+Libraries and header files for Apache Arrow dataset.
 
 %files dataset-devel
 %defattr(-,root,root,-)
@@ -373,6 +389,9 @@ Libraries and header files for Gandiva.
 %{_libdir}/cmake/arrow/GandivaConfig*.cmake
 %{_libdir}/cmake/arrow/GandivaTargets*.cmake
 %{_libdir}/cmake/arrow/FindGandiva.cmake
+%if %{have_re2}
+%{_libdir}/cmake/arrow/FindRE2.cmake
+%endif
 %{_libdir}/libgandiva.a
 %{_libdir}/libgandiva.so
 %{_libdir}/pkgconfig/gandiva.pc
@@ -585,13 +604,13 @@ Documentation for Apache Arrow GLib.
 %{_datadir}/gtk-doc/html/arrow-glib/
 
 %package dataset-glib-libs
-Summary:	Runtime libraries for Apache Arrow Datasets GLib
+Summary:	Runtime libraries for Apache Arrow dataset GLib
 License:	Apache-2.0
 Requires:	%{name}-dataset-libs = %{version}-%{release}
 Requires:	%{name}-glib-libs = %{version}-%{release}
 
 %description dataset-glib-libs
-This package contains the libraries for Apache Arrow Datasets GLib.
+This package contains the libraries for Apache Arrow dataset GLib.
 
 %files dataset-glib-libs
 %defattr(-,root,root,-)
@@ -600,13 +619,13 @@ This package contains the libraries for Apache Arrow Datasets GLib.
 %{_datadir}/gir-1.0/ArrowDataset-1.0.gir
 
 %package dataset-glib-devel
-Summary:	Libraries and header files for Apache Arrow Datasets GLib
+Summary:	Libraries and header files for Apache Arrow dataset GLib
 License:	Apache-2.0
 Requires:	%{name}-dataset-devel = %{version}-%{release}
 Requires:	%{name}-glib-devel = %{version}-%{release}
 
 %description dataset-glib-devel
-Libraries and header files for Apache Arrow Datasets GLib.
+Libraries and header files for Apache Arrow dataset GLib.
 
 %files dataset-glib-devel
 %defattr(-,root,root,-)
@@ -618,11 +637,11 @@ Libraries and header files for Apache Arrow Datasets GLib.
 %{_libdir}/girepository-1.0/ArrowDataset-1.0.typelib
 
 %package dataset-glib-doc
-Summary:	Documentation for Apache Arrow Datasets GLib
+Summary:	Documentation for Apache Arrow dataset GLib
 License:	Apache-2.0
 
 %description dataset-glib-doc
-Documentation for Apache Arrow Datasets GLib.
+Documentation for Apache Arrow dataset GLib.
 
 %files dataset-glib-doc
 %defattr(-,root,root,-)
@@ -770,6 +789,9 @@ Documentation for Apache Parquet GLib.
 %endif
 
 %changelog
+* Mon Jul 20 2020 Krisztián Szűcs <szucs.krisztian@gmail.com> - 1.0.0-1
+- New upstream release.
+
 * Thu Apr 16 2020 Krisztián Szűcs <szucs.krisztian@gmail.com> - 0.17.0-1
 - New upstream release.
 

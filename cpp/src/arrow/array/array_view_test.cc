@@ -329,6 +329,17 @@ TEST(TestArrayView, FixedSizeListAsFlat) {
   // XXX With nulls (currently fails)
 }
 
+TEST(TestArrayView, FixedSizeListAsFixedSizeBinary) {
+  auto ty1 = fixed_size_list(int32(), 1);
+#if ARROW_LITTLE_ENDIAN
+  auto arr = ArrayFromJSON(ty1, "[[2020568934], [2054316386]]");
+#else
+  auto arr = ArrayFromJSON(ty1, "[[1718579064], [1650553466]]");
+#endif
+  auto expected = ArrayFromJSON(fixed_size_binary(4), R"(["foox", "barz"])");
+  CheckView(arr, expected);
+}
+
 TEST(TestArrayView, SparseUnionAsStruct) {
   auto child1 = ArrayFromJSON(int16(), "[0, -1, 42]");
   auto child2 = ArrayFromJSON(int32(), "[0, 1069547520, -1071644672]");
@@ -340,23 +351,6 @@ TEST(TestArrayView, SparseUnionAsStruct) {
   auto expected = ArrayFromJSON(ty1, "[[0, 0, 0], [0, 65535, 1.5], [1, 42, -2.5]]");
   CheckView(arr, expected);
   CheckView(expected, arr);
-
-  // With nulls
-  indices = ArrayFromJSON(int8(), "[null, 0, 1]");
-  ASSERT_OK_AND_ASSIGN(arr, SparseUnionArray::Make(*indices, {child1, child2}));
-  ASSERT_OK(arr->ValidateFull());
-  expected = ArrayFromJSON(ty1, "[null, [0, 65535, 1.5], [1, 42, -2.5]]");
-  CheckView(arr, expected);
-  //   CheckView(expected, arr);  // XXX currently fails
-
-  // With nested nulls
-  child1 = ArrayFromJSON(int16(), "[0, -1, null]");
-  child2 = ArrayFromJSON(int32(), "[0, null, -1071644672]");
-  ASSERT_OK_AND_ASSIGN(arr, SparseUnionArray::Make(*indices, {child1, child2}));
-  ASSERT_OK(arr->ValidateFull());
-  expected = ArrayFromJSON(ty1, "[null, [0, 65535, null], [1, null, -2.5]]");
-  CheckView(arr, expected);
-  //   CheckView(expected, arr);  // XXX currently fails
 }
 
 TEST(TestArrayView, DecimalRoundTrip) {

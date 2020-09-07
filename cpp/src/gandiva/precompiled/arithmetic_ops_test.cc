@@ -101,132 +101,31 @@ TEST(TestArithmeticOps, TestDiv) {
   context.Reset();
 }
 
-TEST(TestArithmeticOps, TestCastINT) {
-  gandiva::ExecutionContext ctx;
+TEST(TestArithmeticOps, TestBitwiseOps) {
+  // bitwise AND
+  EXPECT_EQ(bitwise_and_int32_int32(0x0147D, 0x17159), 0x01059);
+  EXPECT_EQ(bitwise_and_int32_int32(0xFFFFFFCC, 0x00000297), 0x00000284);
+  EXPECT_EQ(bitwise_and_int32_int32(0x000, 0x285), 0x000);
+  EXPECT_EQ(bitwise_and_int64_int64(0x563672F83, 0x0D9FCF85B), 0x041642803);
+  EXPECT_EQ(bitwise_and_int64_int64(0xFFFFFFFFFFDA8F6A, 0xFFFFFFFFFFFF791C),
+            0xFFFFFFFFFFDA0908);
+  EXPECT_EQ(bitwise_and_int64_int64(0x6A5B1, 0x00000), 0x00000);
 
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
+  // bitwise OR
+  EXPECT_EQ(bitwise_or_int32_int32(0x0147D, 0x17159), 0x1757D);
+  EXPECT_EQ(bitwise_or_int32_int32(0xFFFFFFCC, 0x00000297), 0xFFFFFFDF);
+  EXPECT_EQ(bitwise_or_int32_int32(0x000, 0x285), 0x285);
+  EXPECT_EQ(bitwise_or_int64_int64(0x563672F83, 0x0D9FCF85B), 0x5FBFFFFDB);
+  EXPECT_EQ(bitwise_or_int64_int64(0xFFFFFFFFFFDA8F6A, 0xFFFFFFFFFFFF791C),
+            0xFFFFFFFFFFFFFF7E);
+  EXPECT_EQ(bitwise_or_int64_int64(0x6A5B1, 0x00000), 0x6A5B1);
 
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-45", 3), -45);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "0", 1), 0);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "2147483647", 10), 2147483647);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "02147483647", 11), 2147483647);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-2147483648", 11), -2147483648LL);
-  EXPECT_EQ(castINT_utf8(ctx_ptr, "-02147483648", 12), -2147483648LL);
-
-  castINT_utf8(ctx_ptr, "2147483648", 10);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castINT_utf8(ctx_ptr, "-2147483649", 11);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castINT_utf8(ctx_ptr, "12.34", 5);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castINT_utf8(ctx_ptr, "abc", 3);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castINT_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castINT_utf8(ctx_ptr, "-", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-}
-
-TEST(TestArithmeticOps, TestCastBIGINT) {
-  gandiva::ExecutionContext ctx;
-
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
-
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-45", 3), -45);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "0", 1), 0);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "9223372036854775807", 19), 9223372036854775807LL);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "09223372036854775807", 20), 9223372036854775807LL);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-9223372036854775808", 20),
-            -9223372036854775807LL - 1);
-  EXPECT_EQ(castBIGINT_utf8(ctx_ptr, "-009223372036854775808", 22),
-            -9223372036854775807LL - 1);
-
-  castBIGINT_utf8(ctx_ptr, "9223372036854775808", 19);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castBIGINT_utf8(ctx_ptr, "-9223372036854775809", 20);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castBIGINT_utf8(ctx_ptr, "12.34", 5);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castBIGINT_utf8(ctx_ptr, "abc", 3);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castBIGINT_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castBIGINT_utf8(ctx_ptr, "-", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-}
-
-TEST(TestArithmeticOps, TestCastFloat4) {
-  gandiva::ExecutionContext ctx;
-
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
-
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "-45.34", 6), -45.34f);
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "0", 1), 0.0f);
-  EXPECT_EQ(castFLOAT4_utf8(ctx_ptr, "5", 1), 5.0f);
-
-  castFLOAT4_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castFLOAT4_utf8(ctx_ptr, "e", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-}
-
-TEST(TestParseStringHolder, TestCastFloat8) {
-  gandiva::ExecutionContext ctx;
-
-  int64_t ctx_ptr = reinterpret_cast<int64_t>(&ctx);
-
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "-45.34", 6), -45.34);
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "0", 1), 0.0);
-  EXPECT_EQ(castFLOAT8_utf8(ctx_ptr, "5", 1), 5.0);
-
-  castFLOAT8_utf8(ctx_ptr, "", 0);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
-
-  castFLOAT8_utf8(ctx_ptr, "e", 1);
-  EXPECT_THAT(ctx.get_error(),
-              ::testing::HasSubstr("Failed parsing the string to required format"));
-  ctx.Reset();
+  // bitwise NOT
+  EXPECT_EQ(bitwise_not_int32(0x00017159), 0xFFFE8EA6);
+  EXPECT_EQ(bitwise_not_int32(0xFFFFF226), 0x00000DD9);
+  EXPECT_EQ(bitwise_not_int64(0x000000008BCAE9B4), 0xFFFFFFFF7435164B);
+  EXPECT_EQ(bitwise_not_int64(0xFFFFFF966C8D7997), 0x0000006993728668);
+  EXPECT_EQ(bitwise_not_int64(0x0000000000000000), 0xFFFFFFFFFFFFFFFF);
 }
 
 }  // namespace gandiva

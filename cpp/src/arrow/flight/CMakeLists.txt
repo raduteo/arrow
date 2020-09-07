@@ -32,7 +32,6 @@ if(ARROW_TEST_LINKAGE STREQUAL "static")
                                   ${ARROW_TEST_LINK_LIBS})
 else()
   set(ARROW_FLIGHT_TEST_LINK_LIBS arrow_flight_shared arrow_flight_testing_shared
-                                  ${ARROW_FLIGHT_STATIC_LINK_LIBS}
                                   ${ARROW_TEST_LINK_LIBS})
 endif()
 
@@ -131,7 +130,8 @@ if(ARROW_BUILD_TESTS OR ARROW_BUILD_BENCHMARKS OR ARROW_BUILD_INTEGRATION)
 endif()
 
 foreach(LIB_TARGET ${ARROW_FLIGHT_TESTING_LIBRARIES})
-  target_compile_definitions(${LIB_TARGET} PRIVATE ARROW_FLIGHT_EXPORTING)
+  target_compile_definitions(${LIB_TARGET} PRIVATE ARROW_FLIGHT_EXPORTING
+                             ${ARROW_BOOST_PROCESS_COMPILE_DEFINITIONS})
 endforeach()
 
 add_arrow_test(flight_test

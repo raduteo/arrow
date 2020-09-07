@@ -29,13 +29,13 @@ use arrow::array::{
     Int16BufferBuilder, StructArray,
 };
 use arrow::buffer::{Buffer, MutableBuffer};
-use arrow::datatypes::{DataType as ArrowType, Field, IntervalUnit, TimeUnit};
+use arrow::datatypes::{DataType as ArrowType, DateUnit, Field, IntervalUnit, TimeUnit};
 
 use crate::arrow::converter::{
     BinaryArrayConverter, BinaryConverter, BoolConverter, BooleanArrayConverter,
-    Converter, FixedLenBinaryConverter, FixedSizeArrayConverter, Float32Converter,
-    Float64Converter, Int16Converter, Int32Converter, Int64Converter, Int8Converter,
-    Int96ArrayConverter, Int96Converter, TimestampMicrosecondConverter,
+    Converter, Date32Converter, FixedLenBinaryConverter, FixedSizeArrayConverter,
+    Float32Converter, Float64Converter, Int16Converter, Int32Converter, Int64Converter,
+    Int8Converter, Int96ArrayConverter, Int96Converter, TimestampMicrosecondConverter,
     TimestampMillisecondConverter, UInt16Converter, UInt32Converter, UInt64Converter,
     UInt8Converter, Utf8ArrayConverter, Utf8Converter,
 };
@@ -136,10 +136,8 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
         while records_read < batch_size {
             let records_to_read = batch_size - records_read;
 
+            // NB can be 0 if at end of page
             let records_read_once = self.record_reader.read_records(records_to_read)?;
-            if records_read_once == 0 {
-                break; // record reader has no record
-            }
             records_read = records_read + records_read_once;
 
             // Record reader exhausted
@@ -196,11 +194,10 @@ impl<T: DataType> ArrayReader for PrimitiveArrayReader<T> {
                         .convert(self.record_reader.cast::<Int64Type>()),
                     _ => Err(general_err!("No conversion from parquet type to arrow type for timestamp with unit {:?}", unit)),
                 },
-                (ArrowType::Date32(_), PhysicalType::INT32) => {
-                    UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
-                }
-                (ArrowType::Date64(_), PhysicalType::INT64) => {
-                    UInt64Converter::new().convert(self.record_reader.cast::<Int64Type>())
+                (ArrowType::Date32(unit), PhysicalType::INT32) => match unit {
+                    DateUnit::Day => Date32Converter::new()
+                        .convert(self.record_reader.cast::<Int32Type>()),
+                    _ => Err(general_err!("No conversion from parquet type to arrow type for date with unit {:?}", unit)),
                 }
                 (ArrowType::Time32(_), PhysicalType::INT32) => {
                     UInt32Converter::new().convert(self.record_reader.cast::<Int32Type>())
@@ -935,7 +932,7 @@ mod tests {
     use super::*;
     use crate::arrow::converter::Utf8Converter;
     use crate::basic::{Encoding, Type as PhysicalType};
-    use crate::column::page::Page;
+    use crate::column::page::{Page, PageReader};
     use crate::data_type::{ByteArray, DataType, Int32Type, Int64Type};
     use crate::errors::Result;
     use crate::file::reader::{FileReader, SerializedFileReader};
@@ -947,7 +944,7 @@ mod tests {
     use crate::util::test_common::{get_test_file, make_pages};
     use arrow::array::{Array, ArrayRef, PrimitiveArray, StringArray, StructArray};
     use arrow::datatypes::{
-        DataType as ArrowType, Field, Int32Type as ArrowInt32,
+        DataType as ArrowType, Date32Type as ArrowDate32, Field, Int32Type as ArrowInt32,
         TimestampMicrosecondType as ArrowTimestampMicrosecondType,
         TimestampMillisecondType as ArrowTimestampMillisecondType,
         UInt32Type as ArrowUInt32, UInt64Type as ArrowUInt64,
@@ -999,6 +996,33 @@ mod tests {
             values.append(&mut data);
             page_lists.push(Vec::from(pages));
         }
+    }
+
+    #[test]
+    fn test_primitive_array_reader_empty_pages() {
+        // Construct column schema
+        let message_type = "
+        message test_schema {
+          REQUIRED INT32 leaf;
+        }
+        ";
+
+        let schema = parse_message_type(message_type)
+            .map(|t| Rc::new(SchemaDescriptor::new(Rc::new(t))))
+            .unwrap();
+
+        let column_desc = schema.column(0);
+        let page_iterator = EmptyPageIterator::new(schema.clone());
+
+        let mut array_reader = PrimitiveArrayReader::<Int32Type>::new(
+            Box::new(page_iterator),
+            column_desc.clone(),
+        )
+        .unwrap();
+
+        // expect no values to be read
+        let array = array_reader.next_batch(50).unwrap();
+        assert!(array.is_empty());
     }
 
     #[test]
@@ -1160,8 +1184,8 @@ mod tests {
             Int32Type,
             PhysicalType::INT32,
             "DATE",
-            ArrowUInt32,
-            u32
+            ArrowDate32,
+            i32
         );
         test_primitive_array_reader_one_type!(
             Int32Type,
@@ -1450,6 +1474,35 @@ mod tests {
 
         fn get_rep_levels(&self) -> Option<&[i16]> {
             self.rep_levels.as_ref().map(|v| v.as_slice())
+        }
+    }
+
+    /// Iterator for testing reading empty columns
+    struct EmptyPageIterator {
+        schema: SchemaDescPtr,
+    }
+
+    impl EmptyPageIterator {
+        fn new(schema: SchemaDescPtr) -> Self {
+            EmptyPageIterator { schema }
+        }
+    }
+
+    impl Iterator for EmptyPageIterator {
+        type Item = Result<Box<dyn PageReader>>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            None
+        }
+    }
+
+    impl PageIterator for EmptyPageIterator {
+        fn schema(&mut self) -> Result<SchemaDescPtr> {
+            Ok(self.schema.clone())
+        }
+
+        fn column_schema(&mut self) -> Result<ColumnDescPtr> {
+            Ok(self.schema.column(0))
         }
     }
 

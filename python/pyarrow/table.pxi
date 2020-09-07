@@ -41,10 +41,6 @@ cdef class ChunkedArray(_PandasConvertible):
     def __reduce__(self):
         return chunked_array, (self.chunks, self.type)
 
-    def __richcmp__(self, other, int op):
-        function_name = _op_to_function_name(op)
-        return _pc().call_function(function_name, [self, other])
-
     @property
     def data(self):
         import warnings
@@ -189,6 +185,18 @@ cdef class ChunkedArray(_PandasConvertible):
         """
         return _pc().is_valid(self)
 
+    def __eq__(self, other):
+        try:
+            return self.equals(other)
+        except TypeError:
+            return NotImplemented
+
+    def fill_null(self, fill_value):
+        """
+        See pyarrow.compute.fill_null docstring for usage.
+        """
+        return _pc().fill_null(self, fill_value)
+
     def equals(self, ChunkedArray other):
         """
         Return whether the contents of two chunked arrays are equal.
@@ -218,24 +226,35 @@ cdef class ChunkedArray(_PandasConvertible):
     def _to_pandas(self, options, **kwargs):
         return _array_like_to_pandas(self, options)
 
-    def __array__(self, dtype=None):
+    def to_numpy(self):
+        """
+        Return a NumPy copy of this array (experimental).
+
+        Returns
+        -------
+        array : numpy.ndarray
+        """
         cdef:
             PyObject* out
             PandasOptions c_options
             object values
 
         if self.type.id == _Type_EXTENSION:
-            return (
-                chunked_array(
-                    [self.chunk(i).storage for i in range(self.num_chunks)]
-                ).__array__(dtype)
+            storage_array = chunked_array(
+                [chunk.storage for chunk in self.iterchunks()],
+                type=self.type.storage_type
             )
+            return storage_array.to_numpy()
 
         with nogil:
-            check_status(libarrow.ConvertChunkedArrayToPandas(
-                c_options,
-                self.sp_chunked_array,
-                self, &out))
+            check_status(
+                ConvertChunkedArrayToPandas(
+                    c_options,
+                    self.sp_chunked_array,
+                    self,
+                    &out
+                )
+            )
 
         # wrap_array_output uses pandas to convert to Categorical, here
         # always convert to numpy array
@@ -244,6 +263,10 @@ cdef class ChunkedArray(_PandasConvertible):
         if isinstance(values, dict):
             values = np.take(values['dictionary'], values['indices'])
 
+        return values
+
+    def __array__(self, dtype=None):
+        values = self.to_numpy()
         if dtype is None:
             return values
         return values.astype(dtype)
@@ -408,7 +431,6 @@ def chunked_array(arrays, type=None):
         Must all be the same data type. Can be empty only if type also passed.
     type : DataType or string coercible to DataType
 
-
     Returns
     -------
     ChunkedArray
@@ -417,31 +439,35 @@ def chunked_array(arrays, type=None):
         Array arr
         vector[shared_ptr[CArray]] c_arrays
         shared_ptr[CChunkedArray] sp_chunked_array
-        shared_ptr[CDataType] sp_data_type
+
+    type = ensure_type(type, allow_none=True)
 
     if isinstance(arrays, Array):
         arrays = [arrays]
 
     for x in arrays:
-        if isinstance(x, Array):
-            arr = x
-            if type is not None:
-                assert x.type == type
+        arr = x if isinstance(x, Array) else array(x, type=type)
+
+        if type is None:
+            # it allows more flexible chunked array construction from to coerce
+            # subsequent arrays to the firstly inferred array type
+            # it also spares the inference overhead after the first chunk
+            type = arr.type
         else:
-            arr = array(x, type=type)
+            if arr.type != type:
+                raise TypeError(
+                    "All array chunks must have type {}".format(type)
+                )
 
         c_arrays.push_back(arr.sp_array)
 
-    if type:
-        type = ensure_type(type)
-        sp_data_type = pyarrow_unwrap_data_type(type)
-        sp_chunked_array.reset(new CChunkedArray(c_arrays, sp_data_type))
-    else:
-        if c_arrays.size() == 0:
-            raise ValueError("When passing an empty collection of arrays "
-                             "you must also pass the data type")
-        sp_chunked_array.reset(new CChunkedArray(c_arrays))
+    if c_arrays.size() == 0 and type is None:
+        raise ValueError("When passing an empty collection of arrays "
+                         "you must also pass the data type")
 
+    sp_chunked_array.reset(
+        new CChunkedArray(c_arrays, pyarrow_unwrap_data_type(type))
+    )
     with nogil:
         check_status(sp_chunked_array.get().Validate())
 
@@ -1136,6 +1162,37 @@ cdef class Table(_PandasConvertible):
         """
         return _pc().take(self, indices)
 
+    def select(self, object columns):
+        """
+        Select columns of the Table.
+
+        Returns a new Table with the specified columns, and metadata
+        preserved.
+
+        Parameters
+        ----------
+        columns : list-like
+            The column names or integer indices to select.
+
+        Returns
+        -------
+        Table
+
+        """
+        cdef:
+            shared_ptr[CTable] c_table
+            vector[int] c_indices
+
+        for idx in columns:
+            idx = self._ensure_integer_index(idx)
+            idx = _normalize_index(idx, self.num_columns)
+            c_indices.push_back(<int> idx)
+
+        with nogil:
+            c_table = GetResultValue(self.table.SelectColumns(move(c_indices)))
+
+        return pyarrow_wrap_table(c_table)
+
     def replace_schema_metadata(self, metadata=None):
         """
         EXPERIMENTAL: Create shallow copy of table by replacing schema
@@ -1575,6 +1632,26 @@ cdef class Table(_PandasConvertible):
         """
         return self.schema.field(i)
 
+    def _ensure_integer_index(self, i):
+        """
+        Ensure integer index (convert string column name to integer if needed).
+        """
+        if isinstance(i, (bytes, str)):
+            field_indices = self.schema.get_all_field_indices(i)
+
+            if len(field_indices) == 0:
+                raise KeyError("Field \"{}\" does not exist in table schema"
+                               .format(i))
+            elif len(field_indices) > 1:
+                raise KeyError("Field \"{}\" exists {} times in table schema"
+                               .format(i, len(field_indices)))
+            else:
+                return field_indices[0]
+        elif isinstance(i, int):
+            return i
+        else:
+            raise TypeError("Index must either be string or integer")
+
     def column(self, i):
         """
         Select a column by its column name, or numeric index.
@@ -1588,21 +1665,7 @@ cdef class Table(_PandasConvertible):
         -------
         pyarrow.ChunkedArray
         """
-        if isinstance(i, (bytes, str)):
-            field_indices = self.schema.get_all_field_indices(i)
-
-            if len(field_indices) == 0:
-                raise KeyError("Field \"{}\" does not exist in table schema"
-                               .format(i))
-            elif len(field_indices) > 1:
-                raise KeyError("Field \"{}\" exists {} times in table schema"
-                               .format(i, len(field_indices)))
-            else:
-                return self._column(field_indices[0])
-        elif isinstance(i, int):
-            return self._column(i)
-        else:
-            raise TypeError("Index must either be string or integer")
+        return self._column(self._ensure_integer_index(i))
 
     def _column(self, int i):
         """
@@ -1926,7 +1989,7 @@ def record_batch(data, names=None, schema=None, metadata=None):
         raise TypeError("Expected pandas DataFrame or list of arrays")
 
 
-def table(data, names=None, schema=None, metadata=None):
+def table(data, names=None, schema=None, metadata=None, nthreads=None):
     """
     Create a pyarrow.Table from a Python data structure or sequence of arrays.
 
@@ -1946,6 +2009,9 @@ def table(data, names=None, schema=None, metadata=None):
         specified in the schema, when data is a dict or DataFrame).
     metadata : dict or Mapping, default None
         Optional metadata for the schema (if schema not passed).
+    nthreads : int, default None (may use up to system CPU count threads)
+        For pandas.DataFrame inputs: if greater than 1, convert columns to
+        Arrow in parallel using indicated number of threads.
 
     Returns
     -------
@@ -1973,7 +2039,7 @@ def table(data, names=None, schema=None, metadata=None):
             raise ValueError(
                 "The 'names' and 'metadata' arguments are not valid when "
                 "passing a pandas DataFrame")
-        return Table.from_pandas(data, schema=schema)
+        return Table.from_pandas(data, schema=schema, nthreads=nthreads)
     else:
         raise TypeError(
             "Expected pandas DataFrame, python dictionary or list of arrays")

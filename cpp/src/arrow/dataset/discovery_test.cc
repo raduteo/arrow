@@ -80,19 +80,6 @@ class MockDatasetFactory : public DatasetFactory {
   std::vector<std::shared_ptr<Schema>> schemas_;
 };
 
-class MockPartitioning : public Partitioning {
- public:
-  explicit MockPartitioning(std::shared_ptr<Schema> schema)
-      : Partitioning(std::move(schema)) {}
-
-  Result<std::shared_ptr<Expression>> Parse(const std::string& segment,
-                                            int i) const override {
-    return nullptr;
-  }
-
-  std::string type_name() const override { return "mock_partitioning"; }
-};
-
 class MockDatasetFactoryTest : public DatasetFactoryTest {
  public:
   void MakeFactory(std::vector<std::shared_ptr<Schema>> schemas) {
@@ -222,9 +209,10 @@ TEST_F(FileSystemDatasetFactoryTest, MissingDirectories) {
   factory_options_.partitioning = std::make_shared<HivePartitioning>(
       schema({field("a", int32()), field("b", int32())}));
 
+  auto paths = std::vector<std::string>{partition_path, unpartition_path};
+
   ASSERT_OK_AND_ASSIGN(
-      factory_, FileSystemDatasetFactory::Make(fs_, {partition_path, unpartition_path},
-                                               format_, factory_options_));
+      factory_, FileSystemDatasetFactory::Make(fs_, paths, format_, factory_options_));
 
   InspectOptions options;
   AssertInspect(schema({field("a", int32()), field("b", int32())}), options);
@@ -232,6 +220,8 @@ TEST_F(FileSystemDatasetFactoryTest, MissingDirectories) {
 }
 
 TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredDefaultPrefixes) {
+  // When constructing a factory from a FileSelector,
+  // `selector_ignore_prefixes` governs which files are filtered out.
   selector_.recursive = true;
   MakeFactory({
       fs::File("."),
@@ -246,6 +236,8 @@ TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredDefaultPrefixes) {
 }
 
 TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredDefaultExplicitFiles) {
+  // When constructing a factory from an explicit list of paths,
+  // `selector_ignore_prefixes` is ignored.
   selector_.recursive = true;
   std::vector<fs::FileInfo> ignored_by_default = {
       fs::File(".ignored_by_default.parquet"),
@@ -278,7 +270,7 @@ TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredCustomPrefixes) {
 }
 
 TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredNoPrefixes) {
-  // ignore nothing
+  // Ignore nothing
   selector_.recursive = true;
   factory_options_.selector_ignore_prefixes = {};
   MakeFactory({
@@ -292,6 +284,25 @@ TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredNoPrefixes) {
 
   AssertFinishWithPaths({".", "_", "_$folder$/dat", "_SUCCESS", "not_ignored_by_default",
                          "not_ignored_by_default_either/dat"});
+}
+
+TEST_F(FileSystemDatasetFactoryTest, OptionsIgnoredPrefixesWithBaseDirectory) {
+  //  ARROW-9644: the selector base_dir shouldn't be filtered out even if matches
+  // `selector_ignore_prefixes`.
+  std::string dir = "_shouldnt_be_ignored/.dataset/";
+  selector_.base_dir = dir;
+  selector_.recursive = true;
+  MakeFactory({
+      fs::File(dir + "."),
+      fs::File(dir + "_"),
+      fs::File(dir + "_$folder$/dat"),
+      fs::File(dir + "_SUCCESS"),
+      fs::File(dir + "not_ignored_by_default"),
+      fs::File(dir + "not_ignored_by_default_either/dat"),
+  });
+
+  AssertFinishWithPaths(
+      {dir + "not_ignored_by_default", dir + "not_ignored_by_default_either/dat"});
 }
 
 TEST_F(FileSystemDatasetFactoryTest, Inspect) {

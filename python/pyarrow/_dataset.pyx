@@ -77,7 +77,7 @@ cdef CFileSource _make_file_source(object file, FileSystem filesystem=None):
     return c_source
 
 
-cdef class Expression:
+cdef class Expression(_Weakrefable):
 
     cdef:
         shared_ptr[CExpression] wrapped
@@ -216,29 +216,25 @@ cdef class Expression:
     @staticmethod
     def _scalar(value):
         cdef:
-            shared_ptr[CScalar] scalar
+            Scalar scalar
 
-        if value is None:
-            scalar.reset(new CNullScalar())
-        elif isinstance(value, bool):
-            scalar = MakeScalar(<c_bool>value)
-        elif isinstance(value, float):
-            scalar = MakeScalar(<double>value)
-        elif isinstance(value, int):
-            scalar = MakeScalar(<int64_t>value)
-        elif isinstance(value, (bytes, str)):
-            scalar = MakeStringScalar(tobytes(value))
+        if isinstance(value, Scalar):
+            scalar = value
         else:
-            raise TypeError('Not yet supported scalar value: {}'.format(value))
+            scalar = pa.scalar(value)
 
-        return Expression.wrap(CMakeScalarExpression(move(scalar)))
+        return Expression.wrap(
+            shared_ptr[CExpression](
+                new CScalarExpression(move(scalar.unwrap()))
+            )
+        )
 
 
 _deserialize = Expression._deserialize
 cdef Expression _true = Expression._scalar(True)
 
 
-cdef class Dataset:
+cdef class Dataset(_Weakrefable):
     """
     Collection of data fragments and potentially child datasets.
 
@@ -441,6 +437,14 @@ cdef class UnionDataset(Dataset):
         Dataset.init(self, sp)
         self.union_dataset = <CUnionDataset*> sp.get()
 
+    def __reduce__(self):
+        return UnionDataset, (self.schema, self.children)
+
+    @property
+    def children(self):
+        cdef CDatasetVector children = self.union_dataset.children()
+        return [Dataset.wrap(children[i]) for i in range(children.size())]
+
 
 cdef class FileSystemDataset(Dataset):
     """A Dataset of file fragments.
@@ -456,6 +460,8 @@ cdef class FileSystemDataset(Dataset):
     format : FileFormat
         File format of the fragments, currently only ParquetFileFormat,
         IpcFileFormat, and CsvFileFormat are supported.
+    filesystem : FileSystem
+        FileSystem of the fragments.
     root_partition : Expression, optional
         The top-level partition of the DataDataset.
     """
@@ -464,11 +470,12 @@ cdef class FileSystemDataset(Dataset):
         CFileSystemDataset* filesystem_dataset
 
     def __init__(self, fragments, Schema schema, FileFormat format,
-                 root_partition=None):
+                 FileSystem filesystem=None, root_partition=None):
         cdef:
-            FileFragment fragment
+            FileFragment fragment=None
             vector[shared_ptr[CFileFragment]] c_fragments
             CResult[shared_ptr[CDataset]] result
+            shared_ptr[CFileSystem] c_filesystem
 
         root_partition = root_partition or _true
         if not isinstance(root_partition, Expression):
@@ -482,17 +489,37 @@ cdef class FileSystemDataset(Dataset):
                 static_pointer_cast[CFileFragment, CFragment](
                     fragment.unwrap()))
 
+            if filesystem is None:
+                filesystem = fragment.filesystem
+
+        if filesystem is not None:
+            c_filesystem = filesystem.unwrap()
+
         result = CFileSystemDataset.Make(
             pyarrow_unwrap_schema(schema),
             (<Expression> root_partition).unwrap(),
-            (<FileFormat> format).unwrap(),
+            format.unwrap(),
+            c_filesystem,
             c_fragments
         )
         self.init(GetResultValue(result))
 
+    @property
+    def filesystem(self):
+        return FileSystem.wrap(self.filesystem_dataset.filesystem())
+
     cdef void init(self, const shared_ptr[CDataset]& sp):
         Dataset.init(self, sp)
         self.filesystem_dataset = <CFileSystemDataset*> sp.get()
+
+    def __reduce__(self):
+        return FileSystemDataset, (
+            list(self.get_fragments()),
+            self.schema,
+            self.format,
+            self.filesystem,
+            self.partition_expression
+        )
 
     @classmethod
     def from_paths(cls, paths, schema=None, format=None,
@@ -543,7 +570,8 @@ cdef class FileSystemDataset(Dataset):
             format.make_fragment(path, filesystem, partitions[i])
             for i, path in enumerate(paths)
         ]
-        return FileSystemDataset(fragments, schema, format, root_partition)
+        return FileSystemDataset(fragments, schema, format,
+                                 filesystem, root_partition)
 
     @property
     def files(self):
@@ -572,7 +600,7 @@ cdef shared_ptr[CExpression] _insert_implicit_casts(Expression filter,
     )
 
 
-cdef class FileFormat:
+cdef class FileFormat(_Weakrefable):
 
     cdef:
         shared_ptr[CFileFormat] wrapped
@@ -624,7 +652,8 @@ cdef class FileFormat:
         c_source = _make_file_source(file, filesystem)
         c_fragment = <shared_ptr[CFragment]> GetResultValue(
             self.format.MakeFragment(move(c_source),
-                                     partition_expression.unwrap()))
+                                     partition_expression.unwrap(),
+                                     <shared_ptr[CSchema]>nullptr))
         return Fragment.wrap(move(c_fragment))
 
     def __eq__(self, other):
@@ -634,7 +663,7 @@ cdef class FileFormat:
             return False
 
 
-cdef class Fragment:
+cdef class Fragment(_Weakrefable):
     """Fragment of data from a Dataset."""
 
     cdef:
@@ -772,6 +801,14 @@ cdef class FileFragment(Fragment):
         Fragment.init(self, sp)
         self.file_fragment = <CFileFragment*> sp.get()
 
+    def __reduce__(self):
+        buffer = self.buffer
+        return self.format.make_fragment, (
+            self.path if buffer is None else buffer,
+            self.filesystem,
+            self.partition_expression
+        )
+
     @property
     def path(self):
         """
@@ -818,7 +855,7 @@ cdef class FileFragment(Fragment):
         return FileFormat.wrap(self.file_fragment.format())
 
 
-cdef class RowGroupInfo:
+cdef class RowGroupInfo(_Weakrefable):
     """A wrapper class for RowGroup information"""
 
     cdef:
@@ -845,6 +882,32 @@ cdef class RowGroupInfo:
     def num_rows(self):
         return self.info.num_rows()
 
+    @property
+    def total_byte_size(self):
+        return self.info.total_byte_size()
+
+    @property
+    def statistics(self):
+        if not self.info.HasStatistics():
+            return None
+
+        cdef:
+            CStructScalar* c_statistics
+            CStructScalar* c_minmax
+
+        statistics = dict()
+        c_statistics = self.info.statistics().get()
+        for i in range(c_statistics.value.size()):
+            name = frombytes(c_statistics.type.get().field(i).get().name())
+            c_minmax = <CStructScalar*> c_statistics.value[i].get()
+
+            statistics[name] = {
+                'min': pyarrow_wrap_scalar(c_minmax.value[0]).as_py(),
+                'max': pyarrow_wrap_scalar(c_minmax.value[1]).as_py(),
+            }
+
+        return statistics
+
     def __eq__(self, other):
         if not isinstance(other, RowGroupInfo):
             return False
@@ -864,6 +927,26 @@ cdef class ParquetFileFragment(FileFragment):
         FileFragment.init(self, sp)
         self.parquet_file_fragment = <CParquetFileFragment*> sp.get()
 
+    def __reduce__(self):
+        buffer = self.buffer
+        if self.row_groups is not None:
+            row_groups = [row_group.id for row_group in self.row_groups]
+        else:
+            row_groups = None
+        return self.format.make_fragment, (
+            self.path if buffer is None else buffer,
+            self.filesystem,
+            self.partition_expression,
+            row_groups
+        )
+
+    def ensure_complete_metadata(self):
+        """
+        Ensure that all metadata (statistics, physical schema, ...) have
+        been read and cached in this fragment.
+        """
+        check_status(self.parquet_file_fragment.EnsureCompleteMetadata())
+
     @property
     def row_groups(self):
         cdef:
@@ -873,19 +956,20 @@ cdef class ParquetFileFragment(FileFragment):
             return None
         return [RowGroupInfo.wrap(row_group) for row_group in c_row_groups]
 
-    def split_by_row_group(self, Expression predicate=None,
+    def split_by_row_group(self, Expression filter=None,
                            Schema schema=None):
         """
         Split the fragment into multiple fragments.
 
         Yield a Fragment wrapping each row group in this ParquetFileFragment.
         Row groups will be excluded whose metadata contradicts the optional
-        predicate.
+        filter.
 
         Parameters
         ----------
-        predicate : Expression, default None
-            Exclude RowGroups whose statistics contradicts the predicate.
+        filter : Expression, default None
+            Only include the row groups which satisfy this predicate (using
+            the Parquet RowGroup statistics).
         schema : Schema, default None
             Schema to use when filtering row groups. Defaults to the
             Fragment's phsyical schema
@@ -896,18 +980,19 @@ cdef class ParquetFileFragment(FileFragment):
         """
         cdef:
             vector[shared_ptr[CFragment]] c_fragments
-            shared_ptr[CExpression] c_predicate
+            shared_ptr[CExpression] c_filter
             shared_ptr[CFragment] c_fragment
 
         schema = schema or self.physical_schema
-        c_predicate = _insert_implicit_casts(predicate, schema)
+        c_filter = _insert_implicit_casts(filter, schema)
         with nogil:
             c_fragments = move(GetResultValue(
-                self.parquet_file_fragment.SplitByRowGroup(move(c_predicate))))
+                self.parquet_file_fragment.SplitByRowGroup(move(c_filter))))
 
         return [Fragment.wrap(c_fragment) for c_fragment in c_fragments]
 
-cdef class ParquetReadOptions:
+
+cdef class ParquetReadOptions(_Weakrefable):
     """
     Parquet format specific options for reading.
 
@@ -1003,7 +1088,8 @@ cdef class ParquetFileFormat(FileFormat):
     def make_fragment(self, file, filesystem=None,
                       Expression partition_expression=None, row_groups=None):
         cdef:
-            vector[int] c_row_groups
+            vector[int] c_row_group_ids
+            vector[CRowGroupInfo] c_row_groups
 
         partition_expression = partition_expression or _true
 
@@ -1012,12 +1098,14 @@ cdef class ParquetFileFormat(FileFormat):
                                          partition_expression)
 
         c_source = _make_file_source(file, filesystem)
-        c_row_groups = [<int> row_group for row_group in set(row_groups)]
+        c_row_group_ids = [<int> row_group for row_group in set(row_groups)]
+        c_row_groups = CRowGroupInfo.FromIdentifiers(move(c_row_group_ids))
 
         c_fragment = <shared_ptr[CFragment]> GetResultValue(
             self.parquet_format.MakeFragment(move(c_source),
                                              partition_expression.unwrap(),
-                                             move(c_row_groups)))
+                                             move(c_row_groups),
+                                             <shared_ptr[CSchema]>nullptr))
         return Fragment.wrap(move(c_fragment))
 
 
@@ -1061,7 +1149,7 @@ cdef class CsvFileFormat(FileFormat):
         return CsvFileFormat, (self.parse_options,)
 
 
-cdef class Partitioning:
+cdef class Partitioning(_Weakrefable):
 
     cdef:
         shared_ptr[CPartitioning] wrapped
@@ -1105,7 +1193,7 @@ cdef class Partitioning:
         return pyarrow_wrap_schema(self.partitioning.schema())
 
 
-cdef class PartitioningFactory:
+cdef class PartitioningFactory(_Weakrefable):
 
     cdef:
         shared_ptr[CPartitioningFactory] wrapped
@@ -1172,7 +1260,7 @@ cdef class DirectoryPartitioning(Partitioning):
         self.directory_partitioning = <CDirectoryPartitioning*> sp.get()
 
     @staticmethod
-    def discover(field_names):
+    def discover(field_names, object max_partition_dictionary_size=0):
         """
         Discover a DirectoryPartitioning.
 
@@ -1180,6 +1268,11 @@ cdef class DirectoryPartitioning(Partitioning):
         ----------
         field_names : list of str
             The names to associate with the values from the subdirectory names.
+        max_partition_dictionary_size : int or None, default 0
+            The maximum number of unique values to consider for dictionary
+            encoding. By default no field will be inferred as dictionary
+            encoded. If None is provided dictionary encoding will be used for
+            every string field.
 
         Returns
         -------
@@ -1187,12 +1280,18 @@ cdef class DirectoryPartitioning(Partitioning):
             To be used in the FileSystemFactoryOptions.
         """
         cdef:
-            PartitioningFactory factory
+            CPartitioningFactoryOptions options
             vector[c_string] c_field_names
+
+        if max_partition_dictionary_size is None:
+            max_partition_dictionary_size = -1
+
+        options.max_partition_dictionary_size = \
+            int(max_partition_dictionary_size)
+
         c_field_names = [tobytes(s) for s in field_names]
-        factory = PartitioningFactory.wrap(
-            CDirectoryPartitioning.MakeFactory(c_field_names))
-        return factory
+        return PartitioningFactory.wrap(
+            CDirectoryPartitioning.MakeFactory(c_field_names, options))
 
 
 cdef class HivePartitioning(Partitioning):
@@ -1243,9 +1342,17 @@ cdef class HivePartitioning(Partitioning):
         self.hive_partitioning = <CHivePartitioning*> sp.get()
 
     @staticmethod
-    def discover():
+    def discover(object max_partition_dictionary_size=0):
         """
         Discover a HivePartitioning.
+
+        Params
+        ------
+        max_partition_dictionary_size : int or None, default 0
+            The maximum number of unique values to consider for dictionary
+            encoding. By default no field will be inferred as dictionary
+            encoded. If -1 is provided dictionary encoding will be used for
+            every string field.
 
         Returns
         -------
@@ -1253,13 +1360,19 @@ cdef class HivePartitioning(Partitioning):
             To be used in the FileSystemFactoryOptions.
         """
         cdef:
-            PartitioningFactory factory
-        factory = PartitioningFactory.wrap(
-            CHivePartitioning.MakeFactory())
-        return factory
+            CPartitioningFactoryOptions options
+
+        if max_partition_dictionary_size is None:
+            max_partition_dictionary_size = -1
+
+        options.max_partition_dictionary_size = \
+            int(max_partition_dictionary_size)
+
+        return PartitioningFactory.wrap(
+            CHivePartitioning.MakeFactory(options))
 
 
-cdef class DatasetFactory:
+cdef class DatasetFactory(_Weakrefable):
     """
     DatasetFactory is used to create a Dataset, inspect the Schema
     of the fragments contained in it, and declare a partitioning.
@@ -1354,7 +1467,7 @@ cdef class DatasetFactory:
         return Dataset.wrap(GetResultValue(result))
 
 
-cdef class FileSystemFactoryOptions:
+cdef class FileSystemFactoryOptions(_Weakrefable):
     """
     Influences the discovery of filesystem paths.
 
@@ -1558,7 +1671,7 @@ cdef class UnionDatasetFactory(DatasetFactory):
         self.union_factory = <CUnionDatasetFactory*> sp.get()
 
 
-cdef class ParquetFactoryOptions:
+cdef class ParquetFactoryOptions(_Weakrefable):
     """
     Influences the discovery of parquet dataset.
 
@@ -1681,7 +1794,7 @@ cdef class ParquetDatasetFactory(DatasetFactory):
         self.parquet_factory = <CParquetDatasetFactory*> sp.get()
 
 
-cdef class ScanTask:
+cdef class ScanTask(_Weakrefable):
     """Read record batches from a range of a single data fragment.
 
     A ScanTask is meant to be a unit of work to be dispatched.
@@ -1717,8 +1830,12 @@ cdef class ScanTask:
         -------
         record_batches : iterator of RecordBatch
         """
-        for maybe_batch in GetResultValue(self.task.Execute()):
-            yield pyarrow_wrap_batch(GetResultValue(move(maybe_batch)))
+        cdef shared_ptr[CRecordBatch] record_batch
+        with nogil:
+            for maybe_batch in GetResultValue(self.task.Execute()):
+                record_batch = GetResultValue(move(maybe_batch))
+                with gil:
+                    yield pyarrow_wrap_batch(record_batch)
 
 
 cdef shared_ptr[CScanContext] _build_scan_context(bint use_threads=True,
@@ -1750,7 +1867,7 @@ cdef void _populate_builder(const shared_ptr[CScannerBuilder]& ptr,
     check_status(builder.BatchSize(batch_size))
 
 
-cdef class Scanner:
+cdef class Scanner(_Weakrefable):
     """A materialized scan operation with context and options bound.
 
     A scanner is the class that glues the scan tasks, data fragments and data
@@ -1898,3 +2015,94 @@ cdef class Scanner:
         cdef CFragmentIterator c_fragments = self.scanner.GetFragments()
         for maybe_fragment in c_fragments:
             yield Fragment.wrap(GetResultValue(move(maybe_fragment)))
+
+
+def _get_partition_keys(Expression partition_expression):
+    """
+    Extract partition keys (equality constraints between a field and a scalar)
+    from an expression as a dict mapping the field's name to its value.
+
+    NB: All expressions yielded by a HivePartitioning or DirectoryPartitioning
+    will be conjunctions of equality conditions and are accessible through this
+    function. Other subexpressions will be ignored.
+
+    For example, an expression of
+    <pyarrow.dataset.Expression ((part == A:string) and (year == 2016:int32))>
+    is converted to {'part': 'a', 'year': 2016}
+    """
+    cdef:
+        shared_ptr[CExpression] expr = partition_expression.unwrap()
+        pair[c_string, shared_ptr[CScalar]] name_val
+
+    return {
+        frombytes(name_val.first): pyarrow_wrap_scalar(name_val.second).as_py()
+        for name_val in GetResultValue(CGetPartitionKeys(deref(expr.get())))
+    }
+
+
+def _filesystemdataset_write(
+    data, object base_dir, Schema schema not None,
+    FileFormat format not None, FileSystem filesystem not None,
+    Partitioning partitioning not None, bint use_threads=True,
+):
+    """
+    CFileSystemDataset.Write wrapper
+    """
+    cdef:
+        c_string c_base_dir
+        shared_ptr[CSchema] c_schema
+        shared_ptr[CFileFormat] c_format
+        shared_ptr[CFileSystem] c_filesystem
+        shared_ptr[CPartitioning] c_partitioning
+        shared_ptr[CScanContext] c_context
+        # to create iterator of InMemory fragments
+        vector[shared_ptr[CRecordBatch]] c_batches
+        shared_ptr[CFragment] c_fragment
+        vector[shared_ptr[CFragment]] c_fragment_vector
+
+    c_base_dir = tobytes(_stringify_path(base_dir))
+    c_schema = pyarrow_unwrap_schema(schema)
+    c_format = format.unwrap()
+    c_filesystem = filesystem.unwrap()
+    c_partitioning = partitioning.unwrap()
+    c_context = _build_scan_context(use_threads=use_threads)
+
+    if isinstance(data, Dataset):
+        with nogil:
+            check_status(
+                CFileSystemDataset.Write(
+                    c_schema,
+                    c_format,
+                    c_filesystem,
+                    c_base_dir,
+                    c_partitioning,
+                    c_context,
+                    (<Dataset> data).dataset.GetFragments()
+                )
+            )
+    else:
+        # data is list of batches/tables, one element per fragment
+        for table in data:
+            if isinstance(table, Table):
+                for batch in table.to_batches():
+                    c_batches.push_back((<RecordBatch> batch).sp_batch)
+            else:
+                c_batches.push_back((<RecordBatch> table).sp_batch)
+
+            c_fragment = shared_ptr[CFragment](
+                new CInMemoryFragment(c_batches, _true.unwrap()))
+            c_batches.clear()
+            c_fragment_vector.push_back(c_fragment)
+
+        with nogil:
+            check_status(
+                CFileSystemDataset.Write(
+                    c_schema,
+                    c_format,
+                    c_filesystem,
+                    c_base_dir,
+                    c_partitioning,
+                    c_context,
+                    MakeVectorIterator(move(c_fragment_vector))
+                )
+            )

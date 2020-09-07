@@ -38,7 +38,11 @@ Result<Datum> Sum(const Datum& value, ExecContext* ctx) {
 }
 
 Result<Datum> MinMax(const Datum& value, const MinMaxOptions& options, ExecContext* ctx) {
-  return CallFunction("minmax", {value}, &options, ctx);
+  return CallFunction("min_max", {value}, &options, ctx);
+}
+
+Result<Datum> Mode(const Datum& value, ExecContext* ctx) {
+  return CallFunction("mode", {value}, ctx);
 }
 
 }  // namespace compute

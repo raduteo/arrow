@@ -28,7 +28,7 @@ import numpy as np
 from cython.operator cimport dereference as deref
 from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow cimport *
-from pyarrow.lib cimport (Buffer, Array, Schema,
+from pyarrow.lib cimport (_Weakrefable, Buffer, Array, Schema,
                           check_status,
                           MemoryPool, maybe_unbox_memory_pool,
                           Table, NativeFile,
@@ -38,17 +38,14 @@ from pyarrow.lib cimport (Buffer, Array, Schema,
                           pyarrow_wrap_buffer,
                           NativeFile, get_reader, get_writer)
 
-from pyarrow.lib import (ArrowException, NativeFile, _stringify_path,
-                         BufferOutputStream,
-                         _datetime_conversion_functions,
-                         _box_time_milli,
-                         _box_time_micro,
+from pyarrow.lib import (ArrowException, NativeFile, BufferOutputStream,
+                         _stringify_path, _datetime_from_int,
                          tobytes, frombytes)
 
 cimport cpython as cp
 
 
-cdef class Statistics:
+cdef class Statistics(_Weakrefable):
     cdef:
         shared_ptr[CStatistics] statistics
         ColumnChunkMetaData parent
@@ -169,7 +166,7 @@ cdef class Statistics:
         return converted_type_name_from_enum(raw_converted_type)
 
 
-cdef class ParquetLogicalType:
+cdef class ParquetLogicalType(_Weakrefable):
     cdef:
         shared_ptr[const CParquetLogicalType] type
 
@@ -256,28 +253,28 @@ cdef _box_logical_type_value(object value, const ColumnDescriptor* descr):
     elif ltype.type() == ParquetLogicalType_TIME:
         time_unit = (<const CParquetTimeType*> ltype).time_unit()
         if time_unit == ParquetTimeUnit_MILLIS:
-            return _box_time_milli(value)
+            return _datetime_from_int(value, unit=TimeUnit_MILLI).time()
         else:
-            return _box_time_micro(value)
+            return _datetime_from_int(value, unit=TimeUnit_MICRO).time()
     elif ltype.type() == ParquetLogicalType_TIMESTAMP:
         ts_type = <const CParquetTimestampType*> ltype
         time_unit = ts_type.time_unit()
-        if time_unit == ParquetTimeUnit_MILLIS:
-            converter = _datetime_conversion_functions()[TimeUnit_MILLI]
-        elif time_unit == ParquetTimeUnit_MICROS:
-            converter = _datetime_conversion_functions()[TimeUnit_MICRO]
-        elif time_unit == ParquetTimeUnit_NANOS:
-            converter = _datetime_conversion_functions()[TimeUnit_NANO]
-        else:
-            raise ValueError("Unsupported time unit")
-
         if ts_type.is_adjusted_to_utc():
             import pytz
             tzinfo = pytz.utc
         else:
             tzinfo = None
-
-        return converter(value, tzinfo)
+        if time_unit == ParquetTimeUnit_MILLIS:
+            return _datetime_from_int(value, unit=TimeUnit_MILLI,
+                                      tzinfo=tzinfo)
+        elif time_unit == ParquetTimeUnit_MICROS:
+            return _datetime_from_int(value, unit=TimeUnit_MICRO,
+                                      tzinfo=tzinfo)
+        elif time_unit == ParquetTimeUnit_NANOS:
+            return _datetime_from_int(value, unit=TimeUnit_NANO,
+                                      tzinfo=tzinfo)
+        else:
+            raise ValueError("Unsupported time unit")
     elif ltype.type() == ParquetLogicalType_INT:
         itype = <const CParquetIntType*> ltype
         if not itype.is_signed() and itype.bit_width() == 32:
@@ -299,7 +296,7 @@ cdef _box_flba(ParquetFLBA val, uint32_t len):
     return cp.PyBytes_FromStringAndSize(<char*> val.ptr, <Py_ssize_t> len)
 
 
-cdef class ColumnChunkMetaData:
+cdef class ColumnChunkMetaData(_Weakrefable):
     cdef:
         unique_ptr[CColumnChunkMetaData] up_metadata
         CColumnChunkMetaData* metadata
@@ -461,7 +458,7 @@ cdef class ColumnChunkMetaData:
         return self.metadata.total_uncompressed_size()
 
 
-cdef class RowGroupMetaData:
+cdef class RowGroupMetaData(_Weakrefable):
     cdef:
         int index  # for pickling support
         unique_ptr[CRowGroupMetaData] up_metadata
@@ -549,7 +546,7 @@ def _reconstruct_filemetadata(Buffer serialized):
     return metadata
 
 
-cdef class FileMetaData:
+cdef class FileMetaData(_Weakrefable):
     cdef:
         shared_ptr[CFileMetaData] sp_metadata
         CFileMetaData* _metadata
@@ -708,7 +705,7 @@ cdef class FileMetaData:
                 WriteMetaDataFile(deref(self._metadata), sink.get()))
 
 
-cdef class ParquetSchema:
+cdef class ParquetSchema(_Weakrefable):
     cdef:
         FileMetaData parent  # the FileMetaData owning the SchemaDescriptor
         const SchemaDescriptor* schema
@@ -771,7 +768,7 @@ cdef class ParquetSchema:
         return ColumnSchema(self, i)
 
 
-cdef class ColumnSchema:
+cdef class ColumnSchema(_Weakrefable):
     cdef:
         int index
         ParquetSchema parent
@@ -979,7 +976,7 @@ cdef ParquetCompression compression_from_name(name):
         return ParquetCompression_UNCOMPRESSED
 
 
-cdef class ParquetReader:
+cdef class ParquetReader(_Weakrefable):
     cdef:
         object source
         CMemoryPool* pool
@@ -1191,7 +1188,7 @@ cdef class ParquetReader:
         return pyarrow_wrap_chunked_array(out)
 
 
-cdef class ParquetWriter:
+cdef class ParquetWriter(_Weakrefable):
     cdef:
         unique_ptr[FileWriter] writer
         shared_ptr[COutputStream] sink

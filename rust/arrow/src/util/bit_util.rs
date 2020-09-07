@@ -56,6 +56,8 @@ pub fn get_bit(data: &[u8], i: usize) -> bool {
 
 /// Returns whether bit at position `i` in `data` is set or not.
 ///
+/// # Safety
+///
 /// Note this doesn't do any bound checking, for performance reason. The caller is
 /// responsible to guarantee that `i` is within bounds.
 #[inline]
@@ -66,19 +68,40 @@ pub unsafe fn get_bit_raw(data: *const u8, i: usize) -> bool {
 /// Sets bit at position `i` for `data`
 #[inline]
 pub fn set_bit(data: &mut [u8], i: usize) {
-    data[i >> 3] |= BIT_MASK[i & 7]
+    data[i >> 3] |= BIT_MASK[i & 7];
 }
 
 /// Sets bit at position `i` for `data`
+///
+/// # Safety
 ///
 /// Note this doesn't do any bound checking, for performance reason. The caller is
 /// responsible to guarantee that `i` is within bounds.
 #[inline]
 pub unsafe fn set_bit_raw(data: *mut u8, i: usize) {
-    *data.add(i >> 3) |= BIT_MASK[i & 7]
+    *data.add(i >> 3) |= BIT_MASK[i & 7];
+}
+
+/// Sets bit at position `i` for `data` to 0
+#[inline]
+pub fn unset_bit(data: &mut [u8], i: usize) {
+    data[i >> 3] ^= BIT_MASK[i & 7];
+}
+
+/// Sets bit at position `i` for `data` to 0
+///
+/// # Safety
+///
+/// Note this doesn't do any bound checking, for performance reason. The caller is
+/// responsible to guarantee that `i` is within bounds.
+#[inline]
+pub unsafe fn unset_bit_raw(data: *mut u8, i: usize) {
+    *data.add(i >> 3) ^= BIT_MASK[i & 7];
 }
 
 /// Sets bits in the non-inclusive range `start..end` for `data`
+///
+/// # Safety
 ///
 /// Note this doesn't do any bound checking, for performance reason. The caller is
 /// responsible to guarantee that both `start` and `end` are within bounds.
@@ -157,6 +180,8 @@ pub fn ceil(value: usize, divisor: usize) -> usize {
 }
 
 /// Performs SIMD bitwise binary operations.
+///
+/// # Safety
 ///
 /// Note that each slice should be 64 bytes and it is the callers responsibility to ensure
 /// that this is the case.  If passed slices larger than 64 bytes the operation will only
@@ -250,6 +275,17 @@ mod tests {
     }
 
     #[test]
+    fn test_unset_bit() {
+        let mut b = [0b11111111];
+        unset_bit(&mut b, 0);
+        assert_eq!([0b11111110], b);
+        unset_bit(&mut b, 2);
+        assert_eq!([0b11111010], b);
+        unset_bit(&mut b, 5);
+        assert_eq!([0b11011010], b);
+    }
+
+    #[test]
     fn test_set_bit_raw() {
         const NUM_BYTE: usize = 10;
         let mut buf = vec![0; NUM_BYTE];
@@ -261,6 +297,30 @@ mod tests {
             if b {
                 unsafe {
                     set_bit_raw(buf.as_mut_ptr(), i);
+                }
+            }
+        }
+
+        let raw_ptr = buf.as_ptr();
+        for (i, b) in expected.iter().enumerate() {
+            unsafe {
+                assert_eq!(*b, get_bit_raw(raw_ptr, i));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unset_bit_raw() {
+        const NUM_BYTE: usize = 10;
+        let mut buf = vec![255; NUM_BYTE];
+        let mut expected = vec![];
+        let mut rng = thread_rng();
+        for i in 0..8 * NUM_BYTE {
+            let b = rng.gen_bool(0.5);
+            expected.push(b);
+            if !b {
+                unsafe {
+                    unset_bit_raw(buf.as_mut_ptr(), i);
                 }
             }
         }

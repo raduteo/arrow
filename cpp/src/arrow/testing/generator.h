@@ -24,12 +24,12 @@
 
 #include "arrow/record_batch.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/testing/visibility.h"
 #include "arrow/type.h"
-#include "arrow/util/visibility.h"
 
 namespace arrow {
 
-class ARROW_EXPORT ConstantArrayGenerator {
+class ARROW_TESTING_EXPORT ConstantArrayGenerator {
  public:
   /// \brief Generates a constant BooleanArray
   ///
@@ -184,6 +184,19 @@ class ARROW_EXPORT ConstantArrayGenerator {
         return UInt64(size);
       case Type::INT64:
         return Int64(size);
+      case Type::TIME64:
+      case Type::DATE64:
+      case Type::TIMESTAMP: {
+        EXPECT_OK_AND_ASSIGN(auto viewed, Int64(size)->View(type));
+        return viewed;
+      }
+      case Type::INTERVAL_DAY_TIME:
+      case Type::INTERVAL_MONTHS:
+      case Type::TIME32:
+      case Type::DATE32: {
+        EXPECT_OK_AND_ASSIGN(auto viewed, Int32(size)->View(type));
+        return viewed;
+      }
       case Type::FLOAT:
         return Float32(size);
       case Type::DOUBLE:

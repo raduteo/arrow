@@ -63,6 +63,7 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
         CStatus CreateDir(const c_string& path, c_bool recursive)
         CStatus DeleteDir(const c_string& path)
         CStatus DeleteDirContents(const c_string& path)
+        CStatus DeleteRootDirContents()
         CStatus DeleteFile(const c_string& path)
         CStatus DeleteFiles(const vector[c_string]& paths)
         CStatus Move(const c_string& src, const c_string& dest)
@@ -83,6 +84,14 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
     CResult[shared_ptr[CFileSystem]] CFileSystemFromUriOrPath \
         "arrow::fs::FileSystemFromUriOrPath"(const c_string& uri,
                                              c_string* out_path)
+
+    cdef cppclass CFileSystemGlobalOptions \
+            "arrow::fs::FileSystemGlobalOptions":
+        c_string tls_ca_file_path
+        c_string tls_ca_dir_path
+
+    CStatus CFileSystemsInitialize "arrow::fs::Initialize" \
+        (const CFileSystemGlobalOptions& options)
 
     cdef cppclass CLocalFileSystemOptions "arrow::fs::LocalFileSystemOptions":
         c_bool use_mmap
@@ -121,19 +130,35 @@ cdef extern from "arrow/filesystem/api.h" namespace "arrow::fs" nogil:
         c_string endpoint_override
         c_string scheme
         c_bool background_writes
+        c_string role_arn
+        c_string session_name
+        c_string external_id
+        int load_frequency
         void ConfigureDefaultCredentials()
         void ConfigureAccessKey(const c_string& access_key,
-                                const c_string& secret_key)
+                                const c_string& secret_key,
+                                const c_string& session_token)
         c_string GetAccessKey()
         c_string GetSecretKey()
+        c_string GetSessionToken()
         c_bool Equals(const CS3Options& other)
 
         @staticmethod
         CS3Options Defaults()
 
         @staticmethod
+        CS3Options Anonymous()
+
+        @staticmethod
         CS3Options FromAccessKey(const c_string& access_key,
-                                 const c_string& secret_key)
+                                 const c_string& secret_key,
+                                 const c_string& session_token)
+
+        @staticmethod
+        CS3Options FromAssumeRole(const c_string& role_arn,
+                                  const c_string& session_name,
+                                  const c_string& external_id,
+                                  const int load_frequency)
 
     cdef cppclass CS3FileSystem "arrow::fs::S3FileSystem"(CFileSystem):
         @staticmethod
@@ -186,6 +211,7 @@ ctypedef void CallbackGetFileInfoSelector(object, const CFileSelector&,
 ctypedef void CallbackCreateDir(object, const c_string&, c_bool)
 ctypedef void CallbackDeleteDir(object, const c_string&)
 ctypedef void CallbackDeleteDirContents(object, const c_string&)
+ctypedef void CallbackDeleteRootDirContents(object)
 ctypedef void CallbackDeleteFile(object, const c_string&)
 ctypedef void CallbackMove(object, const c_string&, const c_string&)
 ctypedef void CallbackCopyFile(object, const c_string&, const c_string&)
@@ -196,6 +222,7 @@ ctypedef void CallbackOpenInputFile(object, const c_string&,
                                     shared_ptr[CRandomAccessFile]*)
 ctypedef void CallbackOpenOutputStream(object, const c_string&,
                                        shared_ptr[COutputStream]*)
+ctypedef void CallbackNormalizePath(object, const c_string&, c_string*)
 
 cdef extern from "arrow/python/filesystem.h" namespace "arrow::py::fs" nogil:
 
@@ -209,6 +236,7 @@ cdef extern from "arrow/python/filesystem.h" namespace "arrow::py::fs" nogil:
         function[CallbackCreateDir] create_dir
         function[CallbackDeleteDir] delete_dir
         function[CallbackDeleteDirContents] delete_dir_contents
+        function[CallbackDeleteRootDirContents] delete_root_dir_contents
         function[CallbackDeleteFile] delete_file
         function[CallbackMove] move
         function[CallbackCopyFile] copy_file
@@ -216,6 +244,7 @@ cdef extern from "arrow/python/filesystem.h" namespace "arrow::py::fs" nogil:
         function[CallbackOpenInputFile] open_input_file
         function[CallbackOpenOutputStream] open_output_stream
         function[CallbackOpenOutputStream] open_append_stream
+        function[CallbackNormalizePath] normalize_path
 
     cdef cppclass CPyFileSystem "arrow::py::fs::PyFileSystem":
         @staticmethod

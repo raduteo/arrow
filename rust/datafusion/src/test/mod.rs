@@ -19,10 +19,10 @@
 
 use crate::error::Result;
 use crate::execution::context::ExecutionContext;
-use crate::execution::physical_plan::ExecutionPlan;
-use crate::logicalplan::{Expr, LogicalPlan, LogicalPlanBuilder};
+use crate::logical_plan::{Expr, LogicalPlan, LogicalPlanBuilder};
+use crate::physical_plan::ExecutionPlan;
 use arrow::array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use std::env;
 use std::fs::File;
@@ -37,7 +37,7 @@ pub fn arrow_testdata_path() -> String {
 }
 
 /// Execute a physical plan and collect the results
-pub fn execute(plan: &dyn ExecutionPlan) -> Result<Vec<RecordBatch>> {
+pub fn execute(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
     let ctx = ExecutionContext::new();
     ctx.collect(plan)
 }
@@ -87,7 +87,7 @@ pub fn create_partitioned_csv(filename: &str, partitions: usize) -> Result<Strin
 }
 
 /// Get the schema for the aggregate_test_* csv files
-pub fn aggr_test_schema() -> Arc<Schema> {
+pub fn aggr_test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("c1", DataType::Utf8, false),
         Field::new("c2", DataType::UInt32, false),
@@ -228,6 +228,12 @@ pub fn max(expr: Expr) -> Expr {
     Expr::AggregateFunction {
         name: "MAX".to_owned(),
         args: vec![expr],
-        return_type: DataType::Float64,
+    }
+}
+
+pub fn min(expr: Expr) -> Expr {
+    Expr::AggregateFunction {
+        name: "MIN".to_owned(),
+        args: vec![expr],
     }
 }

@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "arrow/array.h"
@@ -83,9 +84,13 @@ class TestCast : public TestBase {
  public:
   void CheckPass(const Array& input, const Array& expected,
                  const std::shared_ptr<DataType>& out_type, const CastOptions& options,
-                 bool check_scalar = true) {
+                 bool check_scalar = true, bool validate_full = true) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<Array> result, Cast(input, out_type, options));
-    ASSERT_OK(result->ValidateFull());
+    if (validate_full) {
+      ASSERT_OK(result->ValidateFull());
+    } else {
+      ASSERT_OK(result->Validate());
+    }
     AssertArraysEqual(expected, *result, /*verbose=*/true);
 
     if (input.type_id() == Type::DECIMAL || out_type->id() == Type::DECIMAL) {
@@ -101,6 +106,28 @@ class TestCast : public TestBase {
     }
   }
 
+  void CheckFails(const Array& input, const std::shared_ptr<DataType>& out_type,
+                  const CastOptions& options, bool check_scalar = true) {
+    ASSERT_RAISES(Invalid, Cast(input, out_type, options));
+
+    if (input.type_id() == Type::DECIMAL || out_type->id() == Type::DECIMAL) {
+      // ARROW-9194
+      check_scalar = false;
+    }
+
+    // For the scalars, check that at least one of the input fails (since many
+    // of the tests contains a mix of passing and failing values). In some
+    // cases we will want to check more precisely
+    if (check_scalar) {
+      int64_t num_failing = 0;
+      for (int64_t i = 0; i < input.length(); ++i) {
+        auto maybe_out = Cast(*input.GetScalar(i), out_type, options);
+        num_failing += static_cast<int>(maybe_out.status().IsInvalid());
+      }
+      ASSERT_GT(num_failing, 0);
+    }
+  }
+
   template <typename InType, typename I_TYPE = typename TestCType<InType>::type>
   void CheckFails(const std::shared_ptr<DataType>& in_type,
                   const std::vector<I_TYPE>& in_values, const std::vector<bool>& is_valid,
@@ -112,24 +139,7 @@ class TestCast : public TestBase {
     } else {
       ArrayFromVector<InType, I_TYPE>(in_type, in_values, &input);
     }
-    ASSERT_RAISES(Invalid, Cast(*input, out_type, options));
-
-    if (in_type->id() == Type::DECIMAL || out_type->id() == Type::DECIMAL) {
-      // ARROW-9194
-      check_scalar = false;
-    }
-
-    // For the scalars, check that at least one of the input fails (since many
-    // of the tests contains a mix of passing and failing values). In some
-    // cases we will want to check more precisely
-    if (check_scalar) {
-      int64_t num_failing = 0;
-      for (int64_t i = 0; i < input->length(); ++i) {
-        auto maybe_out = Cast(*input->GetScalar(i), out_type, options);
-        num_failing += static_cast<int>(maybe_out.status().IsInvalid());
-      }
-      ASSERT_GT(num_failing, 0);
-    }
+    CheckFails(*input, out_type, options, check_scalar);
   }
 
   template <typename InType, typename I_TYPE = typename TestCType<InType>::type>
@@ -156,7 +166,7 @@ class TestCast : public TestBase {
                  const std::vector<I_TYPE>& in_values, const std::vector<bool>& is_valid,
                  const std::shared_ptr<DataType>& out_type,
                  const std::vector<O_TYPE>& out_values, const CastOptions& options,
-                 bool check_scalar = true) {
+                 bool check_scalar = true, bool validate_full = true) {
     ASSERT_EQ(in_values.size(), out_values.size());
     std::shared_ptr<Array> input, expected;
     if (is_valid.size() > 0) {
@@ -167,11 +177,12 @@ class TestCast : public TestBase {
       ArrayFromVector<InType, I_TYPE>(in_type, in_values, &input);
       ArrayFromVector<OutType, O_TYPE>(out_type, out_values, &expected);
     }
-    CheckPass(*input, *expected, out_type, options, check_scalar);
+    CheckPass(*input, *expected, out_type, options, check_scalar, validate_full);
 
     // Check a sliced variant
     if (input->length() > 1) {
-      CheckPass(*input->Slice(1), *expected->Slice(1), out_type, options, check_scalar);
+      CheckPass(*input->Slice(1), *expected->Slice(1), out_type, options, check_scalar,
+                validate_full);
     }
   }
 
@@ -179,10 +190,11 @@ class TestCast : public TestBase {
             typename O_TYPE = typename OutType::c_type>
   void CheckCase(const std::vector<I_TYPE>& in_values, const std::vector<bool>& is_valid,
                  const std::vector<O_TYPE>& out_values, const CastOptions& options,
-                 bool check_scalar = true) {
+                 bool check_scalar = true, bool validate_full = true) {
     CheckCase<InType, OutType, I_TYPE, O_TYPE>(
         TypeTraits<InType>::type_singleton(), in_values, is_valid,
-        TypeTraits<OutType>::type_singleton(), out_values, options, check_scalar);
+        TypeTraits<OutType>::type_singleton(), out_values, options, check_scalar,
+        validate_full);
   }
 
   void CheckCaseJSON(const std::shared_ptr<DataType>& in_type,
@@ -200,6 +212,14 @@ class TestCast : public TestBase {
       CheckPass(*input->Slice(1), *expected->Slice(1), out_type, options,
                 /*check_scalar=*/false);
     }
+  }
+
+  void CheckFailsJSON(const std::shared_ptr<DataType>& in_type,
+                      const std::shared_ptr<DataType>& out_type,
+                      const std::string& in_json, bool check_scalar = true,
+                      const CastOptions& options = CastOptions()) {
+    std::shared_ptr<Array> input = ArrayFromJSON(in_type, in_json);
+    CheckFails(*input, out_type, options, check_scalar);
   }
 
   template <typename SourceType, typename DestType>
@@ -226,7 +246,7 @@ class TestCast : public TestBase {
     // Should accept due to option override
     options.allow_invalid_utf8 = true;
     CheckCase<SourceType, DestType>(strings, all, strings, options,
-                                    /*check_scalar=*/false);
+                                    /*check_scalar=*/false, /*validate_full=*/false);
   }
 
   template <typename SourceType, typename DestType>
@@ -368,6 +388,31 @@ class TestCast : public TestBase {
     CheckCase<SourceType, TimestampType>(src_type, strings, is_valid, type, e, options);
 
     // NOTE: timestamp parsing is tested comprehensively in parsing-util-test.cc
+  }
+
+  void TestCastFloatingToDecimal(const std::shared_ptr<DataType>& in_type) {
+    auto out_type = decimal(5, 2);
+
+    CheckCaseJSON(in_type, out_type, "[0.0, null, 123.45, 123.456, 999.994]",
+                  R"(["0.00", null, "123.45", "123.46", "999.99"])");
+
+    // Overflow
+    CastOptions options{};
+    out_type = decimal(5, 2);
+    CheckFailsJSON(in_type, out_type, "[999.996]", /*check_scalar=*/true, options);
+
+    options.allow_decimal_truncate = true;
+    CheckCaseJSON(in_type, out_type, "[0.0, null, 999.996, 123.45, 999.994]",
+                  R"(["0.00", null, "0.00", "123.45", "999.99"])", /*check_scalar=*/true,
+                  options);
+  }
+
+  void TestCastDecimalToFloating(const std::shared_ptr<DataType>& out_type) {
+    auto in_type = decimal(5, 2);
+
+    CheckCaseJSON(in_type, out_type, R"(["0.00", null, "123.45", "999.99"])",
+                  "[0.0, null, 123.45, 999.99]");
+    // Edge cases are tested in Decimal128::ToReal()
   }
 };
 
@@ -901,6 +946,48 @@ TEST_F(TestCast, DecimalToDecimal) {
   check_truncate(decimal(4, 2), v5, is_valid1, decimal(2, 1), e5);
 }
 
+TEST_F(TestCast, FloatToDecimal) {
+  auto in_type = float32();
+
+  TestCastFloatingToDecimal(in_type);
+
+  // 2**64 + 2**41 (exactly representable as a float)
+  auto out_type = decimal(20, 0);
+  CheckCaseJSON(in_type, out_type, "[1.8446746e+19, -1.8446746e+19]",
+                R"(["18446746272732807168", "-18446746272732807168"])");
+  out_type = decimal(20, 4);
+  CheckCaseJSON(in_type, out_type, "[1.8446746e+15, -1.8446746e+15]",
+                R"(["1844674627273280.7168", "-1844674627273280.7168"])");
+
+  // More edge cases tested in Decimal128::FromReal
+}
+
+TEST_F(TestCast, DoubleToDecimal) {
+  auto in_type = float64();
+
+  TestCastFloatingToDecimal(in_type);
+
+  // 2**64 + 2**11 (exactly representable as a double)
+  auto out_type = decimal(20, 0);
+  CheckCaseJSON(in_type, out_type, "[1.8446744073709556e+19, -1.8446744073709556e+19]",
+                R"(["18446744073709555712", "-18446744073709555712"])");
+  out_type = decimal(20, 4);
+  CheckCaseJSON(in_type, out_type, "[1.8446744073709556e+15, -1.8446744073709556e+15]",
+                R"(["1844674407370955.5712", "-1844674407370955.5712"])");
+
+  // More edge cases tested in Decimal128::FromReal
+}
+
+TEST_F(TestCast, DecimalToFloat) {
+  auto out_type = float32();
+  TestCastDecimalToFloating(out_type);
+}
+
+TEST_F(TestCast, DecimalToDouble) {
+  auto out_type = float64();
+  TestCastDecimalToFloating(out_type);
+}
+
 TEST_F(TestCast, TimestampToTimestamp) {
   CastOptions options;
 
@@ -1371,14 +1458,40 @@ TEST_F(TestCast, ChunkedArray) {
   ASSERT_TRUE(out.chunked_array()->Equals(*ex_carr));
 }
 
-TEST_F(TestCast, UnsupportedTarget) {
-  std::vector<bool> is_valid = {true, false, true, true, true};
-  std::vector<int32_t> v1 = {0, 1, 2, 3, 4};
+TEST_F(TestCast, UnsupportedInputType) {
+  // Casting to a supported target type, but with an unsupported input type
+  // for the target type.
+  const auto arr = ArrayFromJSON(int32(), "[1, 2, 3]");
 
-  std::shared_ptr<Array> arr;
-  ArrayFromVector<Int32Type>(int32(), is_valid, v1, &arr);
+  const auto to_type = list(utf8());
+  const char* expected_message = "Unsupported cast from int32 to list";
 
-  ASSERT_RAISES(NotImplemented, Cast(*arr, list(utf8())));
+  // Try through concrete API
+  EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, ::testing::HasSubstr(expected_message),
+                                  Cast(*arr, to_type));
+
+  // Try through general kernel API
+  CastOptions options;
+  options.to_type = to_type;
+  EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, ::testing::HasSubstr(expected_message),
+                                  CallFunction("cast", {arr}, &options));
+}
+
+TEST_F(TestCast, UnsupportedTargetType) {
+  // Casting to an unsupported target type
+  const auto arr = ArrayFromJSON(int32(), "[1, 2, 3]");
+  const auto to_type = dense_union({field("a", int32())});
+
+  // Try through concrete API
+  const char* expected_message = "Unsupported cast from int32 to dense_union";
+  EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, ::testing::HasSubstr(expected_message),
+                                  Cast(*arr, to_type));
+
+  // Try through general kernel API
+  CastOptions options;
+  options.to_type = to_type;
+  EXPECT_RAISES_WITH_MESSAGE_THAT(NotImplemented, ::testing::HasSubstr(expected_message),
+                                  CallFunction("cast", {arr}, &options));
 }
 
 TEST_F(TestCast, DateTimeZeroCopy) {
@@ -1658,16 +1771,18 @@ typedef ::testing::Types<NullType, UInt8Type, Int8Type, UInt16Type, Int16Type, I
 TYPED_TEST_SUITE(TestDictionaryCast, TestTypes);
 
 TYPED_TEST(TestDictionaryCast, Basic) {
-  CastOptions options;
-  std::shared_ptr<Array> plain_array =
-      TestBase::MakeRandomArray<typename TypeTraits<TypeParam>::ArrayType>(10, 2);
+  std::shared_ptr<Array> dict =
+      TestBase::MakeRandomArray<typename TypeTraits<TypeParam>::ArrayType>(5, 1);
+  for (auto index_ty : all_dictionary_index_types()) {
+    auto indices = ArrayFromJSON(index_ty, "[4, 0, 1, 2, 0, 4, null, 2]");
+    auto dict_ty = dictionary(index_ty, dict->type());
+    auto dict_arr = *DictionaryArray::FromArrays(dict_ty, indices, dict);
+    std::shared_ptr<Array> expected = *Take(*dict, *indices);
 
-  ASSERT_OK_AND_ASSIGN(Datum encoded, DictionaryEncode(plain_array->data()));
-  ASSERT_EQ(encoded.array()->type->id(), Type::DICTIONARY);
-
-  // TODO: Should casting dictionary scalars work?
-  this->CheckPass(*MakeArray(encoded.array()), *plain_array, plain_array->type(), options,
-                  /*check_scalar=*/false);
+    // TODO: Should casting dictionary scalars work?
+    this->CheckPass(*dict_arr, *expected, expected->type(), CastOptions::Safe(),
+                    /*check_scalar=*/false);
+  }
 }
 
 TYPED_TEST(TestDictionaryCast, NoNulls) {

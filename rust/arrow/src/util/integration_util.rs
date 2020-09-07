@@ -73,7 +73,7 @@ pub struct ArrowJsonColumn {
 
 impl ArrowJson {
     /// Compare the Arrow JSON with a record batch reader
-    pub fn equals_reader(&self, reader: &mut RecordBatchReader) -> bool {
+    pub fn equals_reader(&self, reader: &mut dyn RecordBatchReader) -> bool {
         if !self.schema.equals_schema(&reader.schema()) {
             return false;
         }
@@ -380,6 +380,35 @@ fn json_from_col(col: &ArrowJsonColumn, data_type: &DataType) -> Vec<Value> {
             json_from_fixed_size_list_col(col, &**dt, *list_size as usize)
         }
         DataType::Struct(fields) => json_from_struct_col(col, fields),
+        DataType::Int64
+        | DataType::UInt64
+        | DataType::Date64(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_) => {
+            // convert int64 data from strings to numbers
+            let converted_col: Vec<Value> = col
+                .data
+                .clone()
+                .unwrap()
+                .iter()
+                .map(|v| {
+                    Value::Number(match v {
+                        Value::Number(number) => number.clone(),
+                        Value::String(string) => VNumber::from(
+                            string
+                                .parse::<i64>()
+                                .expect("Unable to parse string as i64"),
+                        ),
+                        t => panic!("Cannot convert {} to number", t),
+                    })
+                })
+                .collect();
+            merge_json_array(
+                col.validity.as_ref().unwrap().as_slice(),
+                converted_col.as_slice(),
+            )
+        }
         _ => merge_json_array(
             col.validity.as_ref().unwrap().as_slice(),
             &col.data.clone().unwrap(),
@@ -511,7 +540,6 @@ fn json_from_fixed_size_list_col(
 mod tests {
     use super::*;
 
-    use std::convert::TryFrom;
     use std::fs::File;
     use std::io::Read;
     use std::sync::Arc;
@@ -703,7 +731,7 @@ mod tests {
             vec![None, None, Some(-6473623571954960143)],
             nanos_tz,
         );
-        let utf8s = StringArray::try_from(vec![Some("aa"), None, Some("bbb")]).unwrap();
+        let utf8s = StringArray::from(vec![Some("aa"), None, Some("bbb")]);
 
         let value_data = Int32Array::from(vec![None, Some(2), None, None]);
         let value_offsets = Buffer::from(&[0, 3, 4, 4].to_byte_slice());
@@ -716,8 +744,7 @@ mod tests {
         let lists = ListArray::from(list_data);
 
         let structs_int32s = Int32Array::from(vec![None, Some(-2), None]);
-        let structs_utf8s =
-            StringArray::try_from(vec![None, None, Some("aaaaaa")]).unwrap();
+        let structs_utf8s = StringArray::from(vec![None, None, Some("aaaaaa")]);
         let structs = StructArray::from(vec![
             (
                 Field::new("int32s", DataType::Int32, true),

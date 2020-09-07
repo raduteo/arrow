@@ -20,24 +20,22 @@
 import contextlib
 import glob
 import os
-import os.path as osp
+import os.path
+from os.path import join as pjoin
 import re
 import shlex
 import shutil
 import sys
 
-from Cython.Distutils import build_ext as _build_ext
-import Cython
-
-
 import pkg_resources
 from setuptools import setup, Extension, Distribution
-
-from os.path import join as pjoin
 
 from distutils.command.clean import clean as _clean
 from distutils.util import strtobool
 from distutils import sysconfig
+
+from Cython.Distutils import build_ext as _build_ext
+import Cython
 
 # Check if we're running 64-bit Python
 is_64_bit = sys.maxsize > 2**32
@@ -201,7 +199,7 @@ class build_ext(_build_ext):
                              "be 'release' or 'debug'")
 
         # The directory containing this setup.py
-        source = osp.dirname(osp.abspath(__file__))
+        source = os.path.dirname(os.path.abspath(__file__))
 
         # The staging directory for the module being built
         build_cmd = self.get_finalized_command('build')
@@ -227,6 +225,7 @@ class build_ext(_build_ext):
 
             cmake_options = [
                 '-DPYTHON_EXECUTABLE=%s' % sys.executable,
+                '-DPython3_EXECUTABLE=%s' % sys.executable,
                 static_lib_option,
             ]
 
@@ -519,7 +518,7 @@ def _move_shared_libs_unix(build_prefix, build_lib, lib_name):
 
 # If the event of not running from a git clone (e.g. from a git archive
 # or a Python sdist), see if we can set the version number ourselves
-default_version = '1.0.0-SNAPSHOT'
+default_version = '2.0.0-SNAPSHOT'
 if (not os.path.exists('../.git') and
         not os.environ.get('SETUPTOOLS_SCM_PRETEND_VERSION')):
     if os.path.exists('PKG-INFO'):
@@ -544,6 +543,15 @@ def parse_git(root, **kwargs):
     kwargs['describe_command'] =\
         'git describe --dirty --tags --long --match "apache-arrow-[0-9].*"'
     return parse(root, **kwargs)
+
+
+def guess_next_dev_version(version):
+    if version.exact:
+        return version.format_with('{tag}')
+    else:
+        def guess_next_version(tag_version):
+            return default_version.replace('-SNAPSHOT', '')
+        return version.format_next_version(guess_next_version)
 
 
 with open('README.md') as f:
@@ -595,7 +603,8 @@ setup(
         'root': os.path.dirname(setup_dir),
         'parse': parse_git,
         'write_to': os.path.join(scm_version_write_to_prefix,
-                                 'pyarrow/_generated_version.py')
+                                 'pyarrow/_generated_version.py'),
+        'version_scheme': guess_next_dev_version
     },
     setup_requires=['setuptools_scm', 'cython >= 0.29'] + setup_requires,
     install_requires=install_requires,

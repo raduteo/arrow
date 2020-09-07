@@ -9,21 +9,14 @@ write_parquet(
   sink,
   chunk_size = NULL,
   version = NULL,
-  compression = NULL,
+  compression = default_parquet_compression(),
   compression_level = NULL,
   use_dictionary = NULL,
   write_statistics = NULL,
   data_page_size = NULL,
-  properties = ParquetWriterProperties$create(x, version = version, compression =
-    compression, compression_level = compression_level, use_dictionary = use_dictionary,
-    write_statistics = write_statistics, data_page_size = data_page_size),
   use_deprecated_int96_timestamps = FALSE,
   coerce_timestamps = NULL,
-  allow_truncated_timestamps = FALSE,
- 
-    arrow_properties = ParquetArrowWriterProperties$create(use_deprecated_int96_timestamps
-    = use_deprecated_int96_timestamps, coerce_timestamps = coerce_timestamps,
-    allow_truncated_timestamps = allow_truncated_timestamps)
+  allow_truncated_timestamps = FALSE
 )
 }
 \arguments{
@@ -33,7 +26,8 @@ write_parquet(
 
 \item{chunk_size}{chunk size in number of rows. If NULL, the total number of rows is used.}
 
-\item{version}{parquet version, "1.0" or "2.0". Default "1.0"}
+\item{version}{parquet version, "1.0" or "2.0". Default "1.0". Numeric values
+are coerced to character.}
 
 \item{compression}{compression algorithm. Default "snappy". See details.}
 
@@ -46,12 +40,6 @@ write_parquet(
 \item{data_page_size}{Set a target threshold for the approximate encoded
 size of data pages within a column chunk (in bytes). Default 1 MiB.}
 
-\item{properties}{properties for parquet writer, derived from arguments
-\code{version}, \code{compression}, \code{compression_level}, \code{use_dictionary},
-\code{write_statistics} and \code{data_page_size}. You should not specify any of
-these arguments if you also provide a \code{properties} argument, as they will
-be ignored.}
-
 \item{use_deprecated_int96_timestamps}{Write timestamps to INT96 Parquet format. Default \code{FALSE}.}
 
 \item{coerce_timestamps}{Cast timestamps a particular resolution. Can be
@@ -60,11 +48,6 @@ be ignored.}
 \item{allow_truncated_timestamps}{Allow loss of data when coercing timestamps to a
 particular resolution. E.g. if microsecond or nanosecond data is lost when coercing
 to "ms", do not raise an exception}
-
-\item{arrow_properties}{arrow specific writer properties, derived from arguments
-\code{use_deprecated_int96_timestamps}, \code{coerce_timestamps} and \code{allow_truncated_timestamps}
-You should not specify any of these arguments if you also provide a \code{properties}
-argument, as they will be ignored.}
 }
 \value{
 the input \code{x} invisibly.

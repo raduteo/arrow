@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "arrow/util/value_parsing.h"
-
 extern "C" {
 
 #include <math.h>
@@ -69,6 +67,10 @@ extern "C" {
 NUMERIC_TYPES(BINARY_SYMMETRIC, add, +)
 NUMERIC_TYPES(BINARY_SYMMETRIC, subtract, -)
 NUMERIC_TYPES(BINARY_SYMMETRIC, multiply, *)
+BINARY_SYMMETRIC(bitwise_and, int32, &)
+BINARY_SYMMETRIC(bitwise_and, int64, &)
+BINARY_SYMMETRIC(bitwise_or, int32, |)
+BINARY_SYMMETRIC(bitwise_or, int64, |)
 
 #undef BINARY_SYMMETRIC
 
@@ -234,37 +236,16 @@ DIV(int64)
 DIV_FLOAT(float32)
 DIV_FLOAT(float64)
 
-#define CAST_INT_FROM_STRING(OUT_TYPE, ARROW_TYPE, TYPE_NAME)                       \
-  FORCE_INLINE                                                                      \
-  gdv_##OUT_TYPE cast##TYPE_NAME##_utf8(int64_t context, const char* data,          \
-                                        int32_t len) {                              \
-    gdv_##OUT_TYPE val = 0;                                                         \
-    if (!arrow::internal::StringConverter<ARROW_TYPE>::Convert(data, len, &val)) {  \
-      gdv_fn_context_set_error_msg(context,                                         \
-                                   "Failed parsing the string to required format"); \
-    }                                                                               \
-    return val;                                                                     \
-  }
-
-CAST_INT_FROM_STRING(int32, arrow::Int32Type, INT)
-CAST_INT_FROM_STRING(int64, arrow::Int64Type, BIGINT)
-
-#define CAST_FLOAT_FROM_STRING(OUT_TYPE, ARROW_TYPE, TYPE_NAME)                     \
-  FORCE_INLINE                                                                      \
-  gdv_##OUT_TYPE cast##TYPE_NAME##_utf8(int64_t context, const char* data,          \
-                                        int32_t len) {                              \
-    gdv_##OUT_TYPE val = 0;                                                         \
-    if (!gdv_fn_context_parse_##OUT_TYPE(context, data, len, &val)) {               \
-      gdv_fn_context_set_error_msg(context,                                         \
-                                   "Failed parsing the string to required format"); \
-    }                                                                               \
-    return val;                                                                     \
-  }
-
-CAST_FLOAT_FROM_STRING(float32, arrow::FloatType, FLOAT4)
-CAST_FLOAT_FROM_STRING(float64, arrow::DoubleType, FLOAT8)
-
 #undef DIV_FLOAT
+
+#define BITWISE_NOT(TYPE) \
+  FORCE_INLINE            \
+  gdv_##TYPE bitwise_not_##TYPE(gdv_##TYPE in) { return static_cast<gdv_##TYPE>(~in); }
+
+BITWISE_NOT(int32)
+BITWISE_NOT(int64)
+
+#undef BITWISE_NOT
 
 #undef DATE_FUNCTION
 #undef DATE_TYPES
@@ -272,7 +253,5 @@ CAST_FLOAT_FROM_STRING(float64, arrow::DoubleType, FLOAT8)
 #undef NUMERIC_DATE_TYPES
 #undef NUMERIC_FUNCTION
 #undef NUMERIC_TYPES
-#undef CAST_INT_FROM_STRING
-#undef CAST_FLOAT_FROM_STRING
 
 }  // extern "C"

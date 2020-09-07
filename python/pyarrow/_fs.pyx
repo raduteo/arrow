@@ -27,7 +27,28 @@ from pyarrow.util import _stringify_path
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+import os
 import pathlib
+import sys
+
+
+cdef _init_ca_paths():
+    cdef CFileSystemGlobalOptions options
+
+    import ssl
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile:
+        options.tls_ca_file_path = os.fsencode(paths.cafile)
+    if paths.capath:
+        options.tls_ca_dir_path = os.fsencode(paths.capath)
+    check_status(CFileSystemsInitialize(options))
+
+
+if sys.platform == 'linux':
+    # ARROW-9261: On Linux, we may need to fixup the paths to TLS CA certs
+    # (especially in manylinux packages) since the values hardcoded at
+    # compile-time in libcurl may be wrong.
+    _init_ca_paths()
 
 
 cdef inline c_string _path_as_bytes(path) except *:
@@ -39,20 +60,6 @@ cdef inline c_string _path_as_bytes(path) except *:
     # since the C++ side then decodes from utf-8. On Unix, os.fsencode may be
     # better.
     return tobytes(path)
-
-
-def _normalize_path(FileSystem filesystem, path):
-    """
-    Normalize path for the given filesystem.
-
-    The default implementation of this method is a no-op, but subclasses
-    may allow normalizing irregular path forms (such as Windows local paths).
-    """
-    cdef c_string c_path = _path_as_bytes(path)
-    cdef c_string c_path_normalized
-
-    c_path_normalized = GetResultValue(filesystem.fs.NormalizePath(c_path))
-    return frombytes(c_path_normalized)
 
 
 cdef object _wrap_file_type(CFileType ty):
@@ -71,7 +78,7 @@ cdef CFileType _unwrap_file_type(FileType ty) except *:
     assert 0
 
 
-cdef class FileInfo:
+cdef class FileInfo(_Weakrefable):
     """
     FileSystem entry info.
 
@@ -235,7 +242,7 @@ cdef class FileInfo:
         return (nanoseconds if nanoseconds != -1 else None)
 
 
-cdef class FileSelector:
+cdef class FileSelector(_Weakrefable):
     """
     File and directory selector.
 
@@ -299,7 +306,7 @@ cdef class FileSelector:
                 "recursive={0.recursive}>".format(self))
 
 
-cdef class FileSystem:
+cdef class FileSystem(_Weakrefable):
     """
     Abstract file system API.
     """
@@ -398,16 +405,21 @@ cdef class FileSystem:
 
         Parameters
         ----------
-        paths_or_selector: FileSelector or list of path-likes
-            Either a selector object or a list of path-like objects.
-            The selector's base directory will not be part of the results, even
-            if it exists. If it doesn't exist, use `allow_not_found`.
+        paths_or_selector: FileSelector, path-like or list of path-likes
+            Either a selector object, a path-like object or a list of
+            path-like objects. The selector's base directory will not be
+            part of the results, even if it exists. If it doesn't exist,
+            use `allow_not_found`.
 
         Returns
         -------
-        file_infos : list of FileInfo
+        FileInfo or list of FileInfo
+            Single FileInfo object is returned for a single path, otherwise
+            a list of FileInfo objects is returned.
         """
         cdef:
+            CFileInfo info
+            c_string path
             vector[CFileInfo] infos
             vector[c_string] paths
             CFileSelector selector
@@ -420,8 +432,13 @@ cdef class FileSystem:
             paths = [_path_as_bytes(s) for s in paths_or_selector]
             with nogil:
                 infos = GetResultValue(self.fs.GetFileInfo(paths))
+        elif isinstance(paths_or_selector, (bytes, str)):
+            path =_path_as_bytes(paths_or_selector)
+            with nogil:
+                info = GetResultValue(self.fs.GetFileInfo(path))
+            return FileInfo.wrap(info)
         else:
-            raise TypeError('Must pass either paths or a FileSelector')
+            raise TypeError('Must pass either path(s) or a FileSelector')
 
         return [FileInfo.wrap(info) for info in infos]
 
@@ -454,7 +471,7 @@ cdef class FileSystem:
         with nogil:
             check_status(self.fs.DeleteDir(directory))
 
-    def delete_dir_contents(self, path):
+    def delete_dir_contents(self, path, *, bint accept_root_dir=False):
         """Delete a directory's contents, recursively.
 
         Like delete_dir, but doesn't delete the directory itself.
@@ -463,10 +480,17 @@ cdef class FileSystem:
         ----------
         path : str
             The path of the directory to be deleted.
+        accept_root_dir : boolean, default False
+            Allow deleting the root directory's contents
+            (if path is empty or "/")
         """
         cdef c_string directory = _path_as_bytes(path)
-        with nogil:
-            check_status(self.fs.DeleteDirContents(directory))
+        if accept_root_dir and directory.strip(b"/") == b"":
+            with nogil:
+                check_status(self.fs.DeleteRootDirContents())
+        else:
+            with nogil:
+                check_status(self.fs.DeleteDirContents(directory))
 
     def move(self, src, dest):
         """
@@ -681,6 +705,27 @@ cdef class FileSystem:
             stream, path=path, compression=compression, buffer_size=buffer_size
         )
 
+    def normalize_path(self, path):
+        """
+        Normalize filesystem path.
+
+        Parameters
+        ----------
+        path : str
+            The path to normalize
+
+        Returns
+        -------
+        normalized_path : str
+            The normalized path
+        """
+        cdef:
+            c_string c_path = _path_as_bytes(path)
+            c_string c_path_normalized
+
+        c_path_normalized = GetResultValue(self.fs.NormalizePath(c_path))
+        return frombytes(c_path_normalized)
+
 
 cdef class LocalFileSystem(FileSystem):
     """
@@ -696,7 +741,7 @@ cdef class LocalFileSystem(FileSystem):
         a mmap'ed file or a regular file.
     """
 
-    def __init__(self, use_mmap=False):
+    def __init__(self, *, use_mmap=False):
         cdef:
             CLocalFileSystemOptions opts
             shared_ptr[CLocalFileSystem] fs
@@ -711,9 +756,16 @@ cdef class LocalFileSystem(FileSystem):
         FileSystem.init(self, c_fs)
         self.localfs = <CLocalFileSystem*> c_fs.get()
 
+    @classmethod
+    def _reconstruct(cls, kwargs):
+        # __reduce__ doesn't allow passing named arguments directly to the
+        # reconstructor, hence this wrapper.
+        return cls(**kwargs)
+
     def __reduce__(self):
         cdef CLocalFileSystemOptions opts = self.localfs.options()
-        return LocalFileSystem, (opts.use_mmap,)
+        return LocalFileSystem._reconstruct, (dict(
+            use_mmap=opts.use_mmap),)
 
 
 cdef class SubTreeFileSystem(FileSystem):
@@ -808,6 +860,7 @@ cdef class PyFileSystem(FileSystem):
         vtable.create_dir = _cb_create_dir
         vtable.delete_dir = _cb_delete_dir
         vtable.delete_dir_contents = _cb_delete_dir_contents
+        vtable.delete_root_dir_contents = _cb_delete_root_dir_contents
         vtable.delete_file = _cb_delete_file
         vtable.move = _cb_move
         vtable.copy_file = _cb_copy_file
@@ -815,6 +868,7 @@ cdef class PyFileSystem(FileSystem):
         vtable.open_input_file = _cb_open_input_file
         vtable.open_output_stream = _cb_open_output_stream
         vtable.open_append_stream = _cb_open_append_stream
+        vtable.normalize_path = _cb_normalize_path
 
         wrapped = CPyFileSystem.Make(handler, move(vtable))
         self.init(<shared_ptr[CFileSystem]> wrapped)
@@ -880,6 +934,12 @@ class FileSystemHandler(ABC):
         """
 
     @abstractmethod
+    def delete_root_dir_contents(self):
+        """
+        Implement PyFileSystem.delete_dir_contents("/", accept_root_dir=True).
+        """
+
+    @abstractmethod
     def delete_file(self, path):
         """
         Implement PyFileSystem.delete_file(...).
@@ -919,6 +979,12 @@ class FileSystemHandler(ABC):
     def open_append_stream(self, path):
         """
         Implement PyFileSystem.open_append_stream(...).
+        """
+
+    @abstractmethod
+    def normalize_path(self, path):
+        """
+        Implement PyFileSystem.normalize_path(...).
         """
 
 
@@ -971,6 +1037,9 @@ cdef void _cb_delete_dir(handler, const c_string& path) except *:
 cdef void _cb_delete_dir_contents(handler, const c_string& path) except *:
     handler.delete_dir_contents(frombytes(path))
 
+cdef void _cb_delete_root_dir_contents(handler) except *:
+    handler.delete_root_dir_contents()
+
 cdef void _cb_delete_file(handler, const c_string& path) except *:
     handler.delete_file(frombytes(path))
 
@@ -1013,3 +1082,7 @@ cdef void _cb_open_append_stream(handler, const c_string& path,
         raise TypeError("open_append_stream should have returned "
                         "a PyArrow file")
     out[0] = (<NativeFile> stream).get_output_stream()
+
+cdef void _cb_normalize_path(handler, const c_string& path,
+                             c_string* out) except *:
+    out[0] = tobytes(handler.normalize_path(frombytes(path)))

@@ -32,6 +32,8 @@ use TimeUnit::*;
 /// while preserving the order of the nulls.
 ///
 /// Returns an `ArrowError::ComputeError(String)` if the array type is either unsupported by `sort_to_indices` or `take`.
+///
+/// Null float values (e.g. f64::NAN) are sorted with non-null values, and are ordered higher than other values.
 pub fn sort(values: &ArrayRef, options: Option<SortOptions>) -> Result<ArrayRef> {
     let indices = sort_to_indices(values, options)?;
     take(values, &indices, None)
@@ -44,8 +46,24 @@ pub fn sort_to_indices(
 ) -> Result<UInt32Array> {
     let options = options.unwrap_or_default();
     let range = values.offset()..values.len();
-    let (v, n): (Vec<usize>, Vec<usize>) =
-        range.partition(|index| values.is_valid(*index));
+    // perform a custom range partition for floats, to account for NaN
+    let (v, n): (Vec<usize>, Vec<usize>) = if values.data_type() == &DataType::Float32 {
+        let array = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Unable to downcast array");
+        #[allow(clippy::cmp_nan)]
+        range.partition(|index| array.is_valid(*index) && array.value(*index) != f32::NAN)
+    } else if values.data_type() == &DataType::Float64 {
+        let array = values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Unable to downcast array");
+        #[allow(clippy::cmp_nan)]
+        range.partition(|index| array.is_valid(*index) && array.value(*index) != f64::NAN)
+    } else {
+        range.partition(|index| values.is_valid(*index))
+    };
     let n = n.into_iter().map(|i| i as u32).collect();
     match values.data_type() {
         DataType::Boolean => sort_primitive::<BooleanType>(values, v, n, &options),
@@ -57,6 +75,8 @@ pub fn sort_to_indices(
         DataType::UInt16 => sort_primitive::<UInt16Type>(values, v, n, &options),
         DataType::UInt32 => sort_primitive::<UInt32Type>(values, v, n, &options),
         DataType::UInt64 => sort_primitive::<UInt64Type>(values, v, n, &options),
+        DataType::Float32 => sort_primitive::<Float32Type>(values, v, n, &options),
+        DataType::Float64 => sort_primitive::<Float64Type>(values, v, n, &options),
         DataType::Date32(_) => sort_primitive::<Date32Type>(values, v, n, &options),
         DataType::Date64(_) => sort_primitive::<Date64Type>(values, v, n, &options),
         DataType::Time32(Second) => {
@@ -110,7 +130,7 @@ pub fn sort_to_indices(
 }
 
 /// Options that define how sort kernels should behave
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct SortOptions {
     /// Whether to sort in descending order
     pub descending: bool,
@@ -128,7 +148,7 @@ impl Default for SortOptions {
     }
 }
 
-/// Sort primitive values
+/// Sort primitive values, excluding floats
 fn sort_primitive<T>(
     values: &ArrayRef,
     value_indices: Vec<usize>,
@@ -137,7 +157,7 @@ fn sort_primitive<T>(
 ) -> Result<UInt32Array>
 where
     T: ArrowPrimitiveType,
-    T::Native: std::cmp::Ord,
+    T::Native: std::cmp::PartialOrd,
 {
     let values = as_primitive_array::<T>(values);
     // create tuples that are used for sorting
@@ -147,9 +167,13 @@ where
         .collect::<Vec<(u32, T::Native)>>();
     let mut nulls = null_indices;
     if !options.descending {
-        valids.sort_by_key(|a| a.1);
+        valids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or_else(|| Ordering::Greater));
     } else {
-        valids.sort_by_key(|a| Reverse(a.1));
+        valids.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or_else(|| Ordering::Greater)
+                .reverse()
+        });
         nulls.reverse();
     }
     // collect the order of valid tuples
@@ -199,7 +223,7 @@ fn sort_string(
 }
 
 /// One column to be used in lexicographical sort
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SortColumn {
     pub values: ArrayRef,
     pub options: Option<SortOptions>,
@@ -233,13 +257,13 @@ pub struct SortColumn {
 ///         options: None,
 ///     },
 ///     SortColumn {
-///         values: Arc::new(StringArray::try_from(vec![
+///         values: Arc::new(StringArray::from(vec![
 ///             Some("hello"),
 ///             Some("world"),
 ///             Some(","),
 ///             Some("foobar"),
 ///             Some("!"),
-///         ]).unwrap()) as ArrayRef,
+///         ])) as ArrayRef,
 ///         options: Some(SortOptions {
 ///             descending: true,
 ///             nulls_first: false,
@@ -250,7 +274,7 @@ pub struct SortColumn {
 /// assert_eq!(as_primitive_array::<Int64Type>(&sorted_columns[0]).value(1), -64);
 /// assert!(sorted_columns[0].is_null(0));
 /// ```
-pub fn lexsort(columns: &Vec<SortColumn>) -> Result<Vec<ArrayRef>> {
+pub fn lexsort(columns: &[SortColumn]) -> Result<Vec<ArrayRef>> {
     let indices = lexsort_to_indices(columns)?;
     columns
         .iter()
@@ -260,7 +284,7 @@ pub fn lexsort(columns: &Vec<SortColumn>) -> Result<Vec<ArrayRef>> {
 
 /// Sort elements lexicographically from a list of `ArrayRef` into an unsigned integer
 /// (`UInt32Array`) of indices.
-pub fn lexsort_to_indices(columns: &Vec<SortColumn>) -> Result<UInt32Array> {
+pub fn lexsort_to_indices(columns: &[SortColumn]) -> Result<UInt32Array> {
     if columns.len() == 1 {
         // fallback to non-lexical sort
         let column = &columns[0];
@@ -271,7 +295,7 @@ pub fn lexsort_to_indices(columns: &Vec<SortColumn>) -> Result<UInt32Array> {
     // convert ArrayRefs to OrdArray trait objects and perform row count check
     let flat_columns = columns
         .iter()
-        .map(|column| -> Result<(Box<&OrdArray>, SortOptions)> {
+        .map(|column| -> Result<(&OrdArray, SortOptions)> {
             // row count check
             let curr_row_count = column.values.len() - column.values.offset();
             match row_count {
@@ -292,7 +316,7 @@ pub fn lexsort_to_indices(columns: &Vec<SortColumn>) -> Result<UInt32Array> {
                 column.options.unwrap_or_default(),
             ))
         })
-        .collect::<Result<Vec<(Box<&OrdArray>, SortOptions)>>>()?;
+        .collect::<Result<Vec<(&OrdArray, SortOptions)>>>()?;
 
     let lex_comparator = |a_idx: &usize, b_idx: &usize| -> Ordering {
         for column in flat_columns.iter() {
@@ -304,7 +328,7 @@ pub fn lexsort_to_indices(columns: &Vec<SortColumn>) -> Result<UInt32Array> {
                     match values.cmp_value(*a_idx, *b_idx) {
                         // equal, move on to next column
                         Ordering::Equal => continue,
-                        order @ _ => {
+                        order => {
                             if sort_option.descending {
                                 return order.reverse();
                             } else {
@@ -349,7 +373,7 @@ pub fn lexsort_to_indices(columns: &Vec<SortColumn>) -> Result<UInt32Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{convert::TryFrom, sync::Arc};
+    use std::sync::Arc;
 
     fn test_sort_to_indices_primitive_arrays<T>(
         data: Vec<Option<T::Native>>,
@@ -385,7 +409,7 @@ mod tests {
         options: Option<SortOptions>,
         expected_data: Vec<u32>,
     ) {
-        let output = StringArray::try_from(data).expect("Unable to create string array");
+        let output = StringArray::from(data);
         let expected = UInt32Array::from(expected_data);
         let output = sort_to_indices(&(Arc::new(output) as ArrayRef), options).unwrap();
         assert!(output.equals(&expected))
@@ -396,9 +420,8 @@ mod tests {
         options: Option<SortOptions>,
         expected_data: Vec<Option<&str>>,
     ) {
-        let output = StringArray::try_from(data).expect("Unable to create string array");
-        let expected =
-            StringArray::try_from(expected_data).expect("Unable to create string array");
+        let output = StringArray::from(data);
+        let expected = StringArray::from(expected_data);
         let output = sort(&(Arc::new(output) as ArrayRef), options).unwrap();
         let output = output.as_any().downcast_ref::<StringArray>().unwrap();
         assert!(output.equals(&expected))
@@ -446,6 +469,30 @@ mod tests {
             None,
             vec![0, 5, 3, 1, 4, 2],
         );
+        test_sort_to_indices_primitive_arrays::<Float32Type>(
+            vec![
+                None,
+                Some(-0.05),
+                Some(2.225),
+                Some(-1.01),
+                Some(-0.05),
+                None,
+            ],
+            None,
+            vec![0, 5, 3, 1, 4, 2],
+        );
+        test_sort_to_indices_primitive_arrays::<Float64Type>(
+            vec![
+                None,
+                Some(-0.05),
+                Some(2.225),
+                Some(-1.01),
+                Some(-0.05),
+                None,
+            ],
+            None,
+            vec![0, 5, 3, 1, 4, 2],
+        );
 
         // descending
         test_sort_to_indices_primitive_arrays::<Int8Type>(
@@ -484,6 +531,31 @@ mod tests {
             vec![2, 1, 4, 3, 5, 0],
         );
 
+        test_sort_to_indices_primitive_arrays::<Float32Type>(
+            vec![
+                None,
+                Some(0.005),
+                Some(20.22),
+                Some(-10.3),
+                Some(0.005),
+                None,
+            ],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: false,
+            }),
+            vec![2, 1, 4, 3, 5, 0],
+        );
+
+        test_sort_to_indices_primitive_arrays::<Float64Type>(
+            vec![None, Some(0.0), Some(2.0), Some(-1.0), Some(0.0), None],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: false,
+            }),
+            vec![2, 1, 4, 3, 5, 0],
+        );
+
         // descending, nulls first
         test_sort_to_indices_primitive_arrays::<Int8Type>(
             vec![None, Some(0), Some(2), Some(-1), Some(0), None],
@@ -514,6 +586,24 @@ mod tests {
 
         test_sort_to_indices_primitive_arrays::<Int64Type>(
             vec![None, Some(0), Some(2), Some(-1), Some(0), None],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: true,
+            }),
+            vec![5, 0, 2, 1, 4, 3],
+        );
+
+        test_sort_to_indices_primitive_arrays::<Float32Type>(
+            vec![None, Some(0.1), Some(0.2), Some(-1.3), Some(0.01), None],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: true,
+            }),
+            vec![5, 0, 2, 1, 4, 3],
+        );
+
+        test_sort_to_indices_primitive_arrays::<Float64Type>(
+            vec![None, Some(10.1), Some(100.2), Some(-1.3), Some(10.01), None],
             Some(SortOptions {
                 descending: true,
                 nulls_first: true,
@@ -640,6 +730,22 @@ mod tests {
             }),
             vec![None, None, Some(2), Some(0), Some(0), Some(-1)],
         );
+        test_sort_primitive_arrays::<Float32Type>(
+            vec![None, Some(0.0), Some(2.0), Some(-1.0), Some(0.0), None],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: true,
+            }),
+            vec![None, None, Some(2.0), Some(0.0), Some(0.0), Some(-1.0)],
+        );
+        test_sort_primitive_arrays::<Float64Type>(
+            vec![None, Some(0.0), Some(2.0), Some(-1.0), Some(f64::NAN), None],
+            Some(SortOptions {
+                descending: true,
+                nulls_first: true,
+            }),
+            vec![None, None, Some(f64::NAN), Some(2.0), Some(0.0), Some(-1.0)],
+        );
 
         // int8 nulls first
         test_sort_primitive_arrays::<Int8Type>(
@@ -673,6 +779,22 @@ mod tests {
                 nulls_first: true,
             }),
             vec![None, None, Some(-1), Some(0), Some(0), Some(2)],
+        );
+        test_sort_primitive_arrays::<Float32Type>(
+            vec![None, Some(0.0), Some(2.0), Some(-1.0), Some(0.0), None],
+            Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+            vec![None, None, Some(-1.0), Some(0.0), Some(0.0), Some(2.0)],
+        );
+        test_sort_primitive_arrays::<Float64Type>(
+            vec![None, Some(0.0), Some(2.0), Some(-1.0), Some(f64::NAN), None],
+            Some(SortOptions {
+                descending: false,
+                nulls_first: true,
+            }),
+            vec![None, None, Some(-1.0), Some(0.0), Some(2.0), Some(f64::NAN)],
         );
     }
 
@@ -861,10 +983,7 @@ mod tests {
                 options: None,
             },
             SortColumn {
-                values: Arc::new(
-                    StringArray::try_from(vec![Some("foo")])
-                        .expect("Unable to create string array"),
-                ) as ArrayRef,
+                values: Arc::new(StringArray::from(vec![Some("foo")])) as ArrayRef,
                 options: None,
             },
         ];
@@ -942,15 +1061,12 @@ mod tests {
                 }),
             },
             SortColumn {
-                values: Arc::new(
-                    StringArray::try_from(vec![
-                        Some("foo"),
-                        Some("9"),
-                        Some("7"),
-                        Some("bar"),
-                    ])
-                    .expect("Unable to create string array"),
-                ) as ArrayRef,
+                values: Arc::new(StringArray::from(vec![
+                    Some("foo"),
+                    Some("9"),
+                    Some("7"),
+                    Some("bar"),
+                ])) as ArrayRef,
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: true,
@@ -964,15 +1080,12 @@ mod tests {
                 Some(0),
                 Some(-1),
             ])) as ArrayRef,
-            Arc::new(
-                StringArray::try_from(vec![
-                    Some("9"),
-                    Some("foo"),
-                    Some("bar"),
-                    Some("7"),
-                ])
-                .expect("Unable to create string array"),
-            ) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("9"),
+                Some("foo"),
+                Some("bar"),
+                Some("7"),
+            ])) as ArrayRef,
         ];
         test_lex_sort_arrays(input, expected);
 
@@ -991,15 +1104,12 @@ mod tests {
                 }),
             },
             SortColumn {
-                values: Arc::new(
-                    StringArray::try_from(vec![
-                        Some("foo"),
-                        Some("world"),
-                        Some("hello"),
-                        None,
-                    ])
-                    .expect("Unable to create string array"),
-                ) as ArrayRef,
+                values: Arc::new(StringArray::from(vec![
+                    Some("foo"),
+                    Some("world"),
+                    Some("hello"),
+                    None,
+                ])) as ArrayRef,
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: true,
@@ -1013,15 +1123,12 @@ mod tests {
                 Some(2),
                 Some(-1),
             ])) as ArrayRef,
-            Arc::new(
-                StringArray::try_from(vec![
-                    None,
-                    Some("foo"),
-                    Some("hello"),
-                    Some("world"),
-                ])
-                .expect("Unable to create string array"),
-            ) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("foo"),
+                Some("hello"),
+                Some("world"),
+            ])) as ArrayRef,
         ];
         test_lex_sort_arrays(input, expected);
 
@@ -1040,15 +1147,12 @@ mod tests {
                 }),
             },
             SortColumn {
-                values: Arc::new(
-                    StringArray::try_from(vec![
-                        Some("foo"),
-                        Some("world"),
-                        Some("hello"),
-                        None,
-                    ])
-                    .expect("Unable to create string array"),
-                ) as ArrayRef,
+                values: Arc::new(StringArray::from(vec![
+                    Some("foo"),
+                    Some("world"),
+                    Some("hello"),
+                    None,
+                ])) as ArrayRef,
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: false,
@@ -1062,15 +1166,12 @@ mod tests {
                 None,
                 None,
             ])) as ArrayRef,
-            Arc::new(
-                StringArray::try_from(vec![
-                    Some("hello"),
-                    Some("world"),
-                    Some("foo"),
-                    None,
-                ])
-                .expect("Unable to create string array"),
-            ) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("hello"),
+                Some("world"),
+                Some("foo"),
+                None,
+            ])) as ArrayRef,
         ];
         test_lex_sort_arrays(input, expected);
 
@@ -1090,16 +1191,13 @@ mod tests {
                 }),
             },
             SortColumn {
-                values: Arc::new(
-                    StringArray::try_from(vec![
-                        Some("foo"),
-                        Some("bar"),
-                        Some("world"),
-                        Some("hello"),
-                        None,
-                    ])
-                    .expect("Unable to create string array"),
-                ) as ArrayRef,
+                values: Arc::new(StringArray::from(vec![
+                    Some("foo"),
+                    Some("bar"),
+                    Some("world"),
+                    Some("hello"),
+                    None,
+                ])) as ArrayRef,
                 options: Some(SortOptions {
                     descending: true,
                     nulls_first: true,
@@ -1114,16 +1212,13 @@ mod tests {
                 None,
                 None,
             ])) as ArrayRef,
-            Arc::new(
-                StringArray::try_from(vec![
-                    Some("hello"),
-                    Some("bar"),
-                    Some("world"),
-                    None,
-                    Some("foo"),
-                ])
-                .expect("Unable to create string array"),
-            ) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("hello"),
+                Some("bar"),
+                Some("world"),
+                None,
+                Some("foo"),
+            ])) as ArrayRef,
         ];
         test_lex_sort_arrays(input, expected);
     }

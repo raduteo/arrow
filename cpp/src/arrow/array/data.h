@@ -180,6 +180,22 @@ struct ARROW_EXPORT ArrayData {
     return GetValues<T>(i, offset);
   }
 
+  // Like GetValues, but returns NULLPTR instead of aborting if the underlying
+  // buffer is not a CPU buffer.
+  template <typename T>
+  inline const T* GetValuesSafe(int i, int64_t absolute_offset) const {
+    if (buffers[i] && buffers[i]->is_cpu()) {
+      return reinterpret_cast<const T*>(buffers[i]->data()) + absolute_offset;
+    } else {
+      return NULLPTR;
+    }
+  }
+
+  template <typename T>
+  inline const T* GetValuesSafe(int i) const {
+    return GetValuesSafe<T>(i, offset);
+  }
+
   // Access a buffer's data as a typed C pointer
   template <typename T>
   inline T* GetMutableValues(int i, int64_t absolute_offset) {
@@ -195,13 +211,25 @@ struct ARROW_EXPORT ArrayData {
     return GetMutableValues<T>(i, offset);
   }
 
-  // Construct a zero-copy slice of the data with the indicated offset and length
+  /// \brief Construct a zero-copy slice of the data with the given offset and length
   std::shared_ptr<ArrayData> Slice(int64_t offset, int64_t length) const;
+
+  /// \brief Input-checking variant of Slice
+  ///
+  /// An Invalid Status is returned if the requested slice falls out of bounds.
+  /// Note that unlike Slice, `length` isn't clamped to the available buffer size.
+  Result<std::shared_ptr<ArrayData>> SliceSafe(int64_t offset, int64_t length) const;
 
   void SetNullCount(int64_t v) { null_count.store(v); }
 
   /// \brief Return null count, or compute and set it if it's not known
   int64_t GetNullCount() const;
+
+  bool MayHaveNulls() const {
+    // If an ArrayData is slightly malformed it may have kUnknownNullCount set
+    // but no buffer
+    return null_count.load() != 0 && buffers[0] != NULLPTR;
+  }
 
   std::shared_ptr<DataType> type;
   int64_t length;

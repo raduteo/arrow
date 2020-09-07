@@ -56,12 +56,12 @@ class ARROW_EXPORT KernelContext {
 
   /// \brief Allocate buffer from the context's memory pool. The contents are
   /// not initialized.
-  Result<std::shared_ptr<Buffer>> Allocate(int64_t nbytes);
+  Result<std::shared_ptr<ResizableBuffer>> Allocate(int64_t nbytes);
 
   /// \brief Allocate buffer for bitmap from the context's memory pool. Like
   /// Allocate, the contents of the buffer are not initialized but the last
   /// byte is preemptively zeroed to help avoid ASAN or valgrind issues.
-  Result<std::shared_ptr<Buffer>> AllocateBitmap(int64_t num_bits);
+  Result<std::shared_ptr<ResizableBuffer>> AllocateBitmap(int64_t num_bits);
 
   /// \brief Indicate that an error has occurred, to be checked by a exec caller
   /// \param[in] status a Status instance.
@@ -448,7 +448,7 @@ class ARROW_EXPORT KernelSignature {
 /// type combination for different SIMD levels. Based on the active system's
 /// CPU info or the user's preferences, we can elect to use one over the other.
 struct SimdLevel {
-  enum type { NONE, SSE4_2, AVX, AVX2, AVX512, NEON };
+  enum type { NONE = 0, SSE4_2, AVX, AVX2, AVX512, NEON, MAX };
 };
 
 /// \brief The strategy to use for propagating or otherwise populating the
@@ -555,10 +555,9 @@ struct Kernel {
   bool parallelizable = true;
 
   /// \brief Indicates the level of SIMD instruction support in the host CPU is
-  /// required to use the function. Currently this is not used, but the
-  /// intention is for functions to be able to contain multiple kernels with
-  /// the same signature but different levels of SIMD, so that the most
-  /// optimized kernel supported on a host's processor can be chosen.
+  /// required to use the function. The intention is for functions to be able to
+  /// contain multiple kernels with the same signature but different levels of SIMD,
+  /// so that the most optimized kernel supported on a host's processor can be chosen.
   SimdLevel::type simd_level = SimdLevel::NONE;
 };
 

@@ -48,6 +48,9 @@ class DummyHandler(FileSystemHandler):
     def get_type_name(self):
         return "dummy"
 
+    def normalize_path(self, path):
+        return path
+
     def get_file_info(self, paths):
         info = []
         for path in paths:
@@ -92,7 +95,12 @@ class DummyHandler(FileSystemHandler):
         assert path == "delete_dir"
 
     def delete_dir_contents(self, path):
+        if not path.strip("/"):
+            raise ValueError
         assert path == "delete_dir_contents"
+
+    def delete_root_dir_contents(self):
+        pass
 
     def delete_file(self, path):
         assert path == "delete_file"
@@ -146,6 +154,9 @@ class ProxyHandler(FileSystemHandler):
     def get_type_name(self):
         return "proxy::" + self._fs.type_name
 
+    def normalize_path(self, path):
+        return self._fs.normalize_path(path)
+
     def get_file_info(self, paths):
         return self._fs.get_file_info(paths)
 
@@ -160,6 +171,9 @@ class ProxyHandler(FileSystemHandler):
 
     def delete_dir_contents(self, path):
         return self._fs.delete_dir_contents(path)
+
+    def delete_root_dir_contents(self):
+        return self._fs.delete_dir_contents("", accept_root_dir=True)
 
     def delete_file(self, path):
         return self._fs.delete_file(path)
@@ -209,6 +223,17 @@ def py_localfs(request, tempdir):
 def mockfs(request):
     return dict(
         fs=_MockFileSystem(),
+        pathfn=lambda p: p,
+        allow_copy_file=True,
+        allow_move_dir=True,
+        allow_append_to_file=True,
+    )
+
+
+@pytest.fixture
+def py_mockfs(request):
+    return dict(
+        fs=PyFileSystem(ProxyHandler(_MockFileSystem())),
         pathfn=lambda p: p,
         allow_copy_file=True,
         allow_move_dir=True,
@@ -379,6 +404,10 @@ def py_fsspec_s3fs(request, s3_connection, s3_server):
         id='PyFileSystem(ProxyHandler(LocalFileSystem()))'
     ),
     pytest.param(
+        pytest.lazy_fixture('py_mockfs'),
+        id='PyFileSystem(ProxyHandler(_MockFileSystem()))'
+    ),
+    pytest.param(
         pytest.lazy_fixture('py_fsspec_localfs'),
         id='PyFileSystem(FSSpecHandler(fsspec.LocalFileSystem()))'
     ),
@@ -444,9 +473,9 @@ def check_mtime_or_absent(file_info):
         check_mtime(file_info)
 
 
-def skip_s3fs(fs):
+def skip_fsspec_s3fs(fs):
     if fs.type_name == "py::fsspec+s3":
-        pytest.xfail(reason='Not working with s3fs')
+        pytest.xfail(reason="Not working with fsspec's s3fs")
 
 
 def test_file_info_constructor():
@@ -516,7 +545,7 @@ def test_subtree_filesystem():
 
 
 def test_filesystem_pickling(fs):
-    if isinstance(fs, _MockFileSystem):
+    if fs.type_name.split('::')[-1] == 'mock':
         pytest.xfail(reason='MockFileSystem is not serializable')
 
     serialized = pickle.dumps(fs)
@@ -526,9 +555,9 @@ def test_filesystem_pickling(fs):
 
 
 def test_filesystem_is_functional_after_pickling(fs, pathfn):
-    if isinstance(fs, _MockFileSystem):
+    if fs.type_name.split('::')[-1] == 'mock':
         pytest.xfail(reason='MockFileSystem is not serializable')
-    skip_s3fs(fs)
+    skip_fsspec_s3fs(fs)
 
     aaa = pathfn('a/aa/aaa/')
     bb = pathfn('a/bb')
@@ -554,6 +583,12 @@ def test_type_name():
     assert fs.type_name == "mock"
 
 
+def test_normalize_path(fs):
+    # Trivial path names (without separators) should generally be
+    # already normalized.  Just a sanity check.
+    assert fs.normalize_path("foo") == "foo"
+
+
 def test_non_path_like_input_raises(fs):
     class Path:
         pass
@@ -566,7 +601,7 @@ def test_non_path_like_input_raises(fs):
 
 
 def test_get_file_info(fs, pathfn):
-    skip_s3fs(fs)  # s3fs doesn't create nested directories
+    skip_fsspec_s3fs(fs)  # s3fs doesn't create nested directories
 
     aaa = pathfn('a/aa/aaa/')
     bb = pathfn('a/bb')
@@ -615,9 +650,14 @@ def test_get_file_info(fs, pathfn):
     assert 'FileType.NotFound' in repr(zzz_info)
     check_mtime_absent(zzz_info)
 
+    # with single path
+    aaa_info2 = fs.get_file_info(aaa)
+    assert aaa_info.path == aaa_info2.path
+    assert aaa_info.type == aaa_info2.type
+
 
 def test_get_file_info_with_selector(fs, pathfn):
-    skip_s3fs(fs)
+    skip_fsspec_s3fs(fs)
 
     base_dir = pathfn('selector-dir/')
     file_a = pathfn('selector-dir/test_file_a')
@@ -657,7 +697,7 @@ def test_get_file_info_with_selector(fs, pathfn):
 
 
 def test_create_dir(fs, pathfn):
-    skip_s3fs(fs)  # create_dir doesn't create dir, so delete dir fails
+    skip_fsspec_s3fs(fs)  # create_dir doesn't create dir, so delete dir fails
 
     d = pathfn('test-directory/')
 
@@ -673,7 +713,7 @@ def test_create_dir(fs, pathfn):
 
 
 def test_delete_dir(fs, pathfn):
-    skip_s3fs(fs)
+    skip_fsspec_s3fs(fs)
 
     d = pathfn('directory/')
     nd = pathfn('directory/nested/')
@@ -687,7 +727,7 @@ def test_delete_dir(fs, pathfn):
 
 
 def test_delete_dir_contents(fs, pathfn):
-    skip_s3fs(fs)
+    skip_fsspec_s3fs(fs)
 
     d = pathfn('directory/')
     nd = pathfn('directory/nested/')
@@ -699,6 +739,33 @@ def test_delete_dir_contents(fs, pathfn):
     fs.delete_dir(d)
     with pytest.raises(pa.ArrowIOError):
         fs.delete_dir(d)
+
+
+def _check_root_dir_contents(config):
+    fs = config['fs']
+    pathfn = config['pathfn']
+
+    d = pathfn('directory/')
+    nd = pathfn('directory/nested/')
+
+    fs.create_dir(nd)
+    with pytest.raises(pa.ArrowInvalid):
+        fs.delete_dir_contents("")
+    with pytest.raises(pa.ArrowInvalid):
+        fs.delete_dir_contents("/")
+    with pytest.raises(pa.ArrowInvalid):
+        fs.delete_dir_contents("//")
+
+    fs.delete_dir_contents("", accept_root_dir=True)
+    fs.delete_dir_contents("/", accept_root_dir=True)
+    fs.delete_dir_contents("//", accept_root_dir=True)
+    with pytest.raises(pa.ArrowIOError):
+        fs.delete_dir(d)
+
+
+def test_delete_root_dir_contents(mockfs, py_mockfs):
+    _check_root_dir_contents(mockfs)
+    _check_root_dir_contents(py_mockfs)
 
 
 def test_copy_file(fs, pathfn, allow_copy_file):
@@ -739,6 +806,10 @@ def test_move_directory(fs, pathfn, allow_move_dir):
 
 
 def test_move_file(fs, pathfn):
+    if fs.type_name == "py::fsspec+memory":
+        # https://issues.apache.org/jira/browse/ARROW-9621
+        # https://github.com/intake/filesystem_spec/issues/367
+        pytest.xfail(reason='Not working with in-memory fsspec')
     s = pathfn('test-move-source-file')
     t = pathfn('test-move-target-file')
 
@@ -917,12 +988,20 @@ def test_mockfs_mtime_roundtrip(mockfs):
 
 
 @pytest.mark.s3
-def test_s3_options():
+def test_s3_options(monkeypatch):
     from pyarrow.fs import S3FileSystem
 
+    # Avoid wait for unavailable metadata server in ARN role example below
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
     fs = S3FileSystem(access_key='access', secret_key='secret',
-                      region='us-east-1', scheme='https',
-                      endpoint_override='localhost:8999')
+                      session_token='token', region='us-east-1',
+                      scheme='https', endpoint_override='localhost:8999')
+    assert isinstance(fs, S3FileSystem)
+    assert pickle.loads(pickle.dumps(fs)) == fs
+
+    fs = S3FileSystem(role_arn='role', session_name='session',
+                      external_id='id', load_frequency=100)
     assert isinstance(fs, S3FileSystem)
     assert pickle.loads(pickle.dumps(fs)) == fs
 
@@ -930,6 +1009,14 @@ def test_s3_options():
         S3FileSystem(access_key='access')
     with pytest.raises(ValueError):
         S3FileSystem(secret_key='secret')
+    with pytest.raises(ValueError):
+        S3FileSystem(access_key='access', session_token='token')
+    with pytest.raises(ValueError):
+        S3FileSystem(secret_key='secret', session_token='token')
+    with pytest.raises(ValueError):
+        S3FileSystem(
+            access_key='access', secret_key='secret', role_arn='arn'
+        )
 
 
 @pytest.mark.hdfs
@@ -1185,6 +1272,10 @@ def test_py_filesystem_ops():
 
     fs.delete_dir("delete_dir")
     fs.delete_dir_contents("delete_dir_contents")
+    for path in ("", "/", "//"):
+        with pytest.raises(ValueError):
+            fs.delete_dir_contents(path)
+        fs.delete_dir_contents(path, accept_root_dir=True)
     fs.delete_file("delete_file")
     fs.move("move_from", "move_to")
     fs.copy_file("copy_file_from", "copy_file_to")
@@ -1220,3 +1311,13 @@ def test_py_open_append_stream():
 
     with fs.open_append_stream("somefile") as f:
         f.write(b"data")
+
+
+@pytest.mark.s3
+def test_s3_real_aws():
+    # Exercise connection code with an AWS-backed S3 bucket.
+    # This is a minimal integration check for ARROW-9261 and similar issues.
+    from pyarrow.fs import S3FileSystem
+    fs = S3FileSystem(anonymous=True)
+    entries = fs.get_file_info(FileSelector('ursa-labs-taxi-data'))
+    assert len(entries) > 0

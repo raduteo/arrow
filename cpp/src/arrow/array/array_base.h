@@ -86,15 +86,16 @@ class ARROW_EXPORT Array {
   std::shared_ptr<DataType> type() const { return data_->type; }
   Type::type type_id() const { return data_->type->id(); }
 
-  /// Buffer for the null bitmap.
+  /// Buffer for the validity (null) bitmap, if any. Note that Union types
+  /// never have a null bitmap.
   ///
-  /// Note that for `null_count == 0`, this can be null.
+  /// Note that for `null_count == 0` or for null type, this will be null.
   /// This buffer does not account for any slice offset
   std::shared_ptr<Buffer> null_bitmap() const { return data_->buffers[0]; }
 
   /// Raw pointer to the null bitmap.
   ///
-  /// Note that for `null_count == 0`, this can be null.
+  /// Note that for `null_count == 0` or for null type, this will be null.
   /// This buffer does not account for any slice offset
   const uint8_t* null_bitmap_data() const { return null_bitmap_data_; }
 
@@ -150,6 +151,11 @@ class ARROW_EXPORT Array {
   /// Slice from offset until end of the array
   std::shared_ptr<Array> Slice(int64_t offset) const;
 
+  /// Input-checking variant of Array::Slice
+  Result<std::shared_ptr<Array>> SliceSafe(int64_t offset, int64_t length) const;
+  /// Input-checking variant of Array::Slice
+  Result<std::shared_ptr<Array>> SliceSafe(int64_t offset) const;
+
   std::shared_ptr<ArrayData> data() const { return data_; }
 
   int num_fields() const { return static_cast<int>(data_->child_data.size()); }
@@ -181,9 +187,9 @@ class ARROW_EXPORT Array {
   const uint8_t* null_bitmap_data_;
 
   /// Protected method for constructors
-  inline void SetData(const std::shared_ptr<ArrayData>& data) {
-    if (data->buffers.size() > 0 && data->buffers[0]) {
-      null_bitmap_data_ = data->buffers[0]->data();
+  void SetData(const std::shared_ptr<ArrayData>& data) {
+    if (data->buffers.size() > 0) {
+      null_bitmap_data_ = data->GetValuesSafe<uint8_t>(0, /*offset=*/0);
     } else {
       null_bitmap_data_ = NULLPTR;
     }
@@ -219,15 +225,12 @@ class ARROW_EXPORT PrimitiveArray : public FlatArray {
  protected:
   PrimitiveArray() : raw_values_(NULLPTR) {}
 
-  inline void SetData(const std::shared_ptr<ArrayData>& data) {
-    auto values = data->buffers[1];
+  void SetData(const std::shared_ptr<ArrayData>& data) {
     this->Array::SetData(data);
-    raw_values_ = values == NULLPTR ? NULLPTR : values->data();
+    raw_values_ = data->GetValuesSafe<uint8_t>(1, /*offset=*/0);
   }
 
-  explicit inline PrimitiveArray(const std::shared_ptr<ArrayData>& data) {
-    SetData(data);
-  }
+  explicit PrimitiveArray(const std::shared_ptr<ArrayData>& data) { SetData(data); }
 
   const uint8_t* raw_values_;
 };
@@ -241,7 +244,7 @@ class ARROW_EXPORT NullArray : public FlatArray {
   explicit NullArray(int64_t length);
 
  private:
-  inline void SetData(const std::shared_ptr<ArrayData>& data) {
+  void SetData(const std::shared_ptr<ArrayData>& data) {
     null_bitmap_data_ = NULLPTR;
     data->null_count = data->length;
     data_ = data;

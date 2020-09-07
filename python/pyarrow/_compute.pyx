@@ -24,6 +24,7 @@ import pyarrow.lib as lib
 
 import numpy as np
 
+
 cdef wrap_scalar_function(const shared_ptr[CFunction]& sp_func):
     cdef ScalarFunction func = ScalarFunction.__new__(ScalarFunction)
     func.init(sp_func)
@@ -95,7 +96,7 @@ cdef wrap_scalar_aggregate_kernel(const CScalarAggregateKernel* c_kernel):
     return kernel
 
 
-cdef class Kernel:
+cdef class Kernel(_Weakrefable):
 
     def __init__(self):
         raise TypeError("Do not call {}'s constructor directly"
@@ -138,7 +139,7 @@ cdef class ScalarAggregateKernel(Kernel):
                 .format(frombytes(self.kernel.signature.get().ToString())))
 
 
-cdef class Function:
+cdef class Function(_Weakrefable):
     cdef:
         shared_ptr[CFunction] sp_func
         CFunction* base_func
@@ -173,10 +174,12 @@ num_kernels: {}
     def num_kernels(self):
         return self.base_func.num_kernels()
 
-    def call(self, args, FunctionOptions options=None):
+    def call(self, args, FunctionOptions options=None,
+             MemoryPool memory_pool=None):
         cdef:
             const CFunctionOptions* c_options = NULL
-            CExecContext* c_exec_ctx = NULL
+            CMemoryPool* pool = maybe_unbox_memory_pool(memory_pool)
+            CExecContext c_exec_ctx = CExecContext(pool)
             vector[CDatum] c_args
             CDatum result
 
@@ -188,7 +191,7 @@ num_kernels: {}
         with nogil:
             result = GetResultValue(self.base_func.Execute(c_args,
                                                            c_options,
-                                                           c_exec_ctx))
+                                                           &c_exec_ctx))
 
         return wrap_datum(result)
 
@@ -252,17 +255,18 @@ cdef _pack_compute_args(object values, vector[CDatum]* out):
             out.push_back(CDatum((<Array> val).sp_array))
         elif isinstance(val, ChunkedArray):
             out.push_back(CDatum((<ChunkedArray> val).sp_chunked_array))
-        elif isinstance(val, ScalarValue):
-            out.push_back(CDatum((<ScalarValue> val).sp_scalar))
+        elif isinstance(val, Scalar):
+            out.push_back(CDatum((<Scalar> val).unwrap()))
         elif isinstance(val, RecordBatch):
             out.push_back(CDatum((<RecordBatch> val).sp_batch))
         elif isinstance(val, Table):
             out.push_back(CDatum((<Table> val).sp_table))
         else:
-            raise TypeError(type(val))
+            raise TypeError("Got unexpected argument type {} "
+                            "for compute function".format(type(val)))
 
 
-cdef class FunctionRegistry:
+cdef class FunctionRegistry(_Weakrefable):
     cdef:
         CFunctionRegistry* registry
 
@@ -289,12 +293,12 @@ def function_registry():
     return _global_func_registry
 
 
-def call_function(name, args, options=None):
+def call_function(name, args, options=None, memory_pool=None):
     func = _global_func_registry.get_function(name)
-    return func.call(args, options=options)
+    return func.call(args, options=options, memory_pool=memory_pool)
 
 
-cdef class FunctionOptions:
+cdef class FunctionOptions(_Weakrefable):
 
     cdef const CFunctionOptions* get_options(self) except NULL:
         raise NotImplementedError("Unimplemented base options")
@@ -396,6 +400,18 @@ cdef class CastOptions(FunctionOptions):
     @allow_invalid_utf8.setter
     def allow_invalid_utf8(self, bint flag):
         self.options.allow_invalid_utf8 = flag
+
+
+cdef class MatchSubstringOptions(FunctionOptions):
+    cdef:
+        unique_ptr[CMatchSubstringOptions] match_substring_options
+
+    def __init__(self, pattern):
+        self.match_substring_options.reset(
+            new CMatchSubstringOptions(tobytes(pattern)))
+
+    cdef const CFunctionOptions* get_options(self) except NULL:
+        return self.match_substring_options.get()
 
 
 cdef class FilterOptions(FunctionOptions):

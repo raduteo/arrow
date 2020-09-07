@@ -19,6 +19,8 @@
 FileSystem abstraction to interact with various local and remote filesystems.
 """
 
+from pyarrow.util import _is_path_like, _stringify_path
+
 from pyarrow._fs import (  # noqa
     FileSelector,
     FileType,
@@ -27,7 +29,6 @@ from pyarrow._fs import (  # noqa
     LocalFileSystem,
     SubTreeFileSystem,
     _MockFileSystem,
-    _normalize_path,
     FileSystemHandler,
     PyFileSystem,
 )
@@ -43,7 +44,8 @@ except ImportError:
     _not_imported.append("HadoopFileSystem")
 
 try:
-    from pyarrow._s3fs import S3FileSystem, initialize_s3, finalize_s3  # noqa
+    from pyarrow._s3fs import (  # noqa
+        S3FileSystem, S3LogLevel, initialize_s3, finalize_s3)
 except ImportError:
     _not_imported.append("S3FileSystem")
 else:
@@ -60,6 +62,62 @@ def __getattr__(name):
     raise AttributeError(
         "module 'pyarrow.fs' has no attribute '{0}'".format(name)
     )
+
+
+def _ensure_filesystem(
+    filesystem, use_mmap=False, allow_legacy_filesystem=False
+):
+    if isinstance(filesystem, FileSystem):
+        return filesystem
+
+    # handle fsspec-compatible filesystems
+    try:
+        import fsspec
+    except ImportError:
+        pass
+    else:
+        if isinstance(filesystem, fsspec.AbstractFileSystem):
+            if type(filesystem).__name__ == 'LocalFileSystem':
+                # In case its a simple LocalFileSystem, use native arrow one
+                return LocalFileSystem(use_mmap=use_mmap)
+            return PyFileSystem(FSSpecHandler(filesystem))
+
+    # map old filesystems to new ones
+    import pyarrow.filesystem as legacyfs
+
+    if isinstance(filesystem, legacyfs.LocalFileSystem):
+        return LocalFileSystem(use_mmap=use_mmap)
+    # TODO handle HDFS?
+    if allow_legacy_filesystem and isinstance(filesystem, legacyfs.FileSystem):
+        return filesystem
+
+    raise TypeError("Unrecognized filesystem: {}".format(type(filesystem)))
+
+
+def _resolve_filesystem_and_path(
+    path, filesystem=None, allow_legacy_filesystem=False
+):
+    """
+    Return filesystem/path from path which could be an URI or a plain
+    filesystem path.
+    """
+    if not _is_path_like(path):
+        if filesystem is not None:
+            raise ValueError(
+                "'filesystem' passed but the specified path is file-like, so"
+                " there is nothing to open with 'filesystem'."
+            )
+        return filesystem, path
+
+    path = _stringify_path(path)
+
+    if filesystem is not None:
+        filesystem = _ensure_filesystem(
+            filesystem, allow_legacy_filesystem=allow_legacy_filesystem
+        )
+        return filesystem, path
+    else:
+        return FileSystem.from_uri(path)
 
 
 class FSSpecHandler(FileSystemHandler):
@@ -89,6 +147,9 @@ class FSSpecHandler(FileSystemHandler):
         if isinstance(protocol, list):
             protocol = protocol[0]
         return "fsspec+{0}".format(protocol)
+
+    def normalize_path(self, path):
+        return path
 
     @staticmethod
     def _create_file_info(path, info):
@@ -145,12 +206,21 @@ class FSSpecHandler(FileSystemHandler):
     def delete_dir(self, path):
         self.fs.rm(path, recursive=True)
 
-    def delete_dir_contents(self, path):
+    def _delete_dir_contents(self, path):
         for subpath in self.fs.listdir(path, detail=False):
             if self.fs.isdir(subpath):
                 self.fs.rm(subpath, recursive=True)
             elif self.fs.isfile(subpath):
                 self.fs.rm(subpath)
+
+    def delete_dir_contents(self, path):
+        if path.strip("/") == "":
+            raise ValueError(
+                "delete_dir_contents called on path '", path, "'")
+        self._delete_dir_contents(path)
+
+    def delete_root_dir_contents(self):
+        self._delete_dir_contents("/")
 
     def delete_file(self, path):
         # fs.rm correctly raises IsADirectoryError when `path` is a directory
@@ -160,7 +230,7 @@ class FSSpecHandler(FileSystemHandler):
         self.fs.rm(path)
 
     def move(self, src, dest):
-        self.fs.mv(src, dest)
+        self.fs.mv(src, dest, recursive=True)
 
     def copy_file(self, src, dest):
         # fs.copy correctly raises IsADirectoryError when `src` is a directory

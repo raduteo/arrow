@@ -23,6 +23,16 @@ add_custom_target(toolchain)
 add_custom_target(toolchain-benchmarks)
 add_custom_target(toolchain-tests)
 
+# Accumulate all bundled targets and we will splice them together later as
+# libarrow_dependencies.a so that third party libraries have something usable
+# to create statically-linked builds with some BUNDLED dependencies, including
+# allocators like jemalloc and mimalloc
+set(ARROW_BUNDLED_STATIC_LIBS)
+
+# Accumulate all system dependencies to provide suitable static link
+# parameters to the third party libraries.
+set(ARROW_SYSTEM_DEPENDENCIES)
+
 # ----------------------------------------------------------------------
 # Toolchain linkage options
 
@@ -60,7 +70,7 @@ set(ARROW_THIRDPARTY_DEPENDENCIES
     Thrift
     utf8proc
     ZLIB
-    ZSTD)
+    zstd)
 
 # TODO(wesm): External GTest shared libraries are not currently
 # supported when building with MSVC because of the way that
@@ -134,42 +144,68 @@ macro(build_dependency DEPENDENCY_NAME)
     build_protobuf()
   elseif("${DEPENDENCY_NAME}" STREQUAL "RE2")
     build_re2()
+  elseif("${DEPENDENCY_NAME}" STREQUAL "Snappy")
+    build_snappy()
   elseif("${DEPENDENCY_NAME}" STREQUAL "Thrift")
     build_thrift()
   elseif("${DEPENDENCY_NAME}" STREQUAL "utf8proc")
     build_utf8proc()
   elseif("${DEPENDENCY_NAME}" STREQUAL "ZLIB")
     build_zlib()
-  elseif("${DEPENDENCY_NAME}" STREQUAL "ZSTD")
+  elseif("${DEPENDENCY_NAME}" STREQUAL "zstd")
     build_zstd()
   else()
     message(FATAL_ERROR "Unknown thirdparty dependency to build: ${DEPENDENCY_NAME}")
   endif()
 endmacro()
 
-macro(resolve_dependency DEPENDENCY_NAME)
-  if(${DEPENDENCY_NAME}_SOURCE STREQUAL "AUTO")
-    find_package(${DEPENDENCY_NAME} MODULE)
-    if(NOT ${${DEPENDENCY_NAME}_FOUND})
-      build_dependency(${DEPENDENCY_NAME})
-    endif()
-  elseif(${DEPENDENCY_NAME}_SOURCE STREQUAL "BUNDLED")
-    build_dependency(${DEPENDENCY_NAME})
-  elseif(${DEPENDENCY_NAME}_SOURCE STREQUAL "SYSTEM")
-    find_package(${DEPENDENCY_NAME} REQUIRED)
+# Find modules are needed by the consumer in case of a static build, or if the
+# linkage is PUBLIC or INTERFACE.
+macro(provide_find_module DEPENDENCY_NAME)
+  set(module_ "${CMAKE_SOURCE_DIR}/cmake_modules/Find${DEPENDENCY_NAME}.cmake")
+  if(EXISTS "${module_}")
+    message(STATUS "Providing cmake module for ${DEPENDENCY_NAME}")
+    install(FILES "${module_}" DESTINATION "${ARROW_CMAKE_INSTALL_DIR}")
   endif()
+  unset(module_)
 endmacro()
 
-macro(resolve_dependency_with_version DEPENDENCY_NAME REQUIRED_VERSION)
+macro(resolve_dependency DEPENDENCY_NAME)
+  set(options)
+  set(one_value_args REQUIRED_VERSION)
+  cmake_parse_arguments(ARG
+                        "${options}"
+                        "${one_value_args}"
+                        "${multi_value_args}"
+                        ${ARGN})
+  if(ARG_UNPARSED_ARGUMENTS)
+    message(SEND_ERROR "Error: unrecognized arguments: ${ARG_UNPARSED_ARGUMENTS}")
+  endif()
+
   if(${DEPENDENCY_NAME}_SOURCE STREQUAL "AUTO")
-    find_package(${DEPENDENCY_NAME} ${REQUIRED_VERSION} MODULE)
-    if(NOT ${${DEPENDENCY_NAME}_FOUND})
+    if(ARG_REQUIRED_VERSION)
+      find_package(${DEPENDENCY_NAME} ${ARG_REQUIRED_VERSION} MODULE)
+    else()
+      find_package(${DEPENDENCY_NAME} MODULE)
+    endif()
+    if(${${DEPENDENCY_NAME}_FOUND})
+      set(${DEPENDENCY_NAME}_SOURCE "SYSTEM")
+    else()
       build_dependency(${DEPENDENCY_NAME})
+      set(${DEPENDENCY_NAME}_SOURCE "BUNDLED")
     endif()
   elseif(${DEPENDENCY_NAME}_SOURCE STREQUAL "BUNDLED")
     build_dependency(${DEPENDENCY_NAME})
   elseif(${DEPENDENCY_NAME}_SOURCE STREQUAL "SYSTEM")
-    find_package(${DEPENDENCY_NAME} ${REQUIRED_VERSION} REQUIRED)
+    if(ARG_REQUIRED_VERSION)
+      find_package(${DEPENDENCY_NAME} ${ARG_REQUIRED_VERSION} REQUIRED)
+    else()
+      find_package(${DEPENDENCY_NAME} REQUIRED)
+    endif()
+  endif()
+  if(${DEPENDENCY_NAME}_SOURCE STREQUAL "SYSTEM")
+    provide_find_module(${DEPENDENCY_NAME})
+    list(APPEND ARROW_SYSTEM_DEPENDENCIES ${DEPENDENCY_NAME})
   endif()
 endmacro()
 
@@ -213,8 +249,9 @@ if(ARROW_ORC OR ARROW_FLIGHT OR ARROW_GANDIVA)
   set(ARROW_WITH_PROTOBUF ON)
 endif()
 
-if(ARROW_COMPUTE)
-  set(ARROW_WITH_UTF8PROC ON)
+if(NOT ARROW_COMPUTE)
+  # utf8proc is only potentially used in kernels for now
+  set(ARROW_WITH_UTF8PROC OFF)
 endif()
 
 # ----------------------------------------------------------------------
@@ -684,6 +721,9 @@ macro(build_boost)
   set(Boost_INCLUDE_DIRS "${BOOST_INCLUDE_DIR}")
   add_dependencies(toolchain boost_ep)
   set(BOOST_VENDORED TRUE)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS boost_system_static boost_filesystem_static
+              boost_regex_static)
 endmacro()
 
 if(ARROW_FLIGHT AND ARROW_BUILD_TESTS)
@@ -832,34 +872,12 @@ macro(build_snappy)
                                    "${SNAPPY_PREFIX}/include")
   add_dependencies(toolchain snappy_ep)
   add_dependencies(Snappy::snappy snappy_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS Snappy::snappy)
 endmacro()
 
 if(ARROW_WITH_SNAPPY)
-  if(Snappy_SOURCE STREQUAL "AUTO")
-    # Normally *Config.cmake files reside in /usr/lib/cmake but Snappy
-    # errornously places them in ${CMAKE_ROOT}/Modules/
-    # This is fixed in 1.1.7 but fedora (30) still installs into the wrong
-    # location.
-    # https://bugzilla.redhat.com/show_bug.cgi?id=1679727
-    # https://src.fedoraproject.org/rpms/snappy/pull-request/1
-    find_package(Snappy QUIET HINTS "${CMAKE_ROOT}/Modules/")
-    if(NOT Snappy_FOUND)
-      find_package(SnappyAlt)
-    endif()
-    if(NOT Snappy_FOUND AND NOT SnappyAlt_FOUND)
-      build_snappy()
-    endif()
-  elseif(Snappy_SOURCE STREQUAL "BUNDLED")
-    build_snappy()
-  elseif(Snappy_SOURCE STREQUAL "SYSTEM")
-    # SnappyConfig.cmake is not installed on Ubuntu/Debian
-    # TODO: Make a bug report upstream
-    find_package(Snappy HINTS "${CMAKE_ROOT}/Modules/")
-    if(NOT Snappy_FOUND)
-      find_package(SnappyAlt REQUIRED)
-    endif()
-  endif()
-
+  resolve_dependency(Snappy)
   # TODO: Don't use global includes but rather target_include_directories
   get_target_property(SNAPPY_INCLUDE_DIRS Snappy::snappy INTERFACE_INCLUDE_DIRECTORIES)
   include_directories(SYSTEM ${SNAPPY_INCLUDE_DIRS})
@@ -886,7 +904,7 @@ macro(build_brotli)
     "${BROTLI_PREFIX}/${BROTLI_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}brotlicommon-static${CMAKE_STATIC_LIBRARY_SUFFIX}"
     )
   set(BROTLI_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${BROTLI_PREFIX}"
-                        -DCMAKE_INSTALL_LIBDIR=${BROTLI_LIB_DIR} -DBUILD_SHARED_LIBS=OFF)
+                        -DCMAKE_INSTALL_LIBDIR=${BROTLI_LIB_DIR})
 
   externalproject_add(brotli_ep
                       URL ${BROTLI_SOURCE_URL}
@@ -918,6 +936,9 @@ macro(build_brotli)
                         PROPERTIES IMPORTED_LOCATION "${BROTLI_STATIC_LIBRARY_DEC}"
                                    INTERFACE_INCLUDE_DIRECTORIES "${BROTLI_INCLUDE_DIR}")
   add_dependencies(Brotli::brotlidec brotli_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS Brotli::brotlicommon Brotli::brotlienc
+              Brotli::brotlidec)
 endmacro()
 
 if(ARROW_WITH_BROTLI)
@@ -975,6 +996,7 @@ if(ARROW_USE_OPENSSL)
                                      INTERFACE_INCLUDE_DIRECTORIES
                                      "${OPENSSL_INCLUDE_DIR}")
   endif()
+  list(APPEND ARROW_SYSTEM_DEPENDENCIES "OpenSSL")
 
   include_directories(SYSTEM ${OPENSSL_INCLUDE_DIR})
 else()
@@ -1035,6 +1057,8 @@ macro(build_glog)
                         PROPERTIES IMPORTED_LOCATION "${GLOG_STATIC_LIB}"
                                    INTERFACE_INCLUDE_DIRECTORIES "${GLOG_INCLUDE_DIR}")
   add_dependencies(glog::glog glog_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS glog::glog)
 endmacro()
 
 if(ARROW_USE_GLOG)
@@ -1104,6 +1128,8 @@ macro(build_gflags)
   set(GFLAGS_LIBRARIES ${GFLAGS_LIBRARY})
 
   set(GFLAGS_VENDORED TRUE)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS gflags_static)
 endmacro()
 
 if(ARROW_NEED_GFLAGS)
@@ -1211,6 +1237,8 @@ macro(build_thrift)
   add_dependencies(toolchain thrift_ep)
   add_dependencies(thrift::thrift thrift_ep)
   set(THRIFT_VERSION ${ARROW_THRIFT_BUILD_VERSION})
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS thrift::thrift)
 endmacro()
 
 if(ARROW_WITH_THRIFT)
@@ -1218,7 +1246,7 @@ if(ARROW_WITH_THRIFT)
   # to build Boost, so don't look again if already found.
   if(NOT Thrift_FOUND AND NOT THRIFT_FOUND)
     # Thrift c++ code generated by 0.13 requires 0.11 or greater
-    resolve_dependency_with_version(Thrift 0.11.0)
+    resolve_dependency(Thrift REQUIRED_VERSION 0.11.0)
   endif()
   # TODO: Don't use global includes but rather target_include_directories
   include_directories(SYSTEM ${THRIFT_INCLUDE_DIR})
@@ -1239,29 +1267,51 @@ macro(build_protobuf)
     PROTOC_STATIC_LIB
     "${PROTOBUF_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}protoc${CMAKE_STATIC_LIBRARY_SUFFIX}"
     )
+  set(Protobuf_PROTOC_LIBRARY "${PROTOC_STATIC_LIB}")
   set(PROTOBUF_COMPILER "${PROTOBUF_PREFIX}/bin/protoc")
-  set(PROTOBUF_CONFIGURE_ARGS
-      "AR=${CMAKE_AR}"
-      "RANLIB=${CMAKE_RANLIB}"
-      "CC=${CMAKE_C_COMPILER}"
-      "CXX=${CMAKE_CXX_COMPILER}"
-      "--disable-shared"
-      "--prefix=${PROTOBUF_PREFIX}"
-      "CFLAGS=${EP_C_FLAGS}"
-      "CXXFLAGS=${EP_CXX_FLAGS}")
-  set(PROTOBUF_BUILD_COMMAND ${MAKE} ${MAKE_BUILD_ARGS})
-  if(CMAKE_OSX_SYSROOT)
-    list(APPEND PROTOBUF_CONFIGURE_ARGS "SDKROOT=${CMAKE_OSX_SYSROOT}")
-    list(APPEND PROTOBUF_BUILD_COMMAND "SDKROOT=${CMAKE_OSX_SYSROOT}")
+
+  if(CMAKE_VERSION VERSION_LESS 3.7)
+    set(PROTOBUF_CONFIGURE_ARGS
+        "AR=${CMAKE_AR}"
+        "RANLIB=${CMAKE_RANLIB}"
+        "CC=${CMAKE_C_COMPILER}"
+        "CXX=${CMAKE_CXX_COMPILER}"
+        "--disable-shared"
+        "--prefix=${PROTOBUF_PREFIX}"
+        "CFLAGS=${EP_C_FLAGS}"
+        "CXXFLAGS=${EP_CXX_FLAGS}")
+    set(PROTOBUF_BUILD_COMMAND ${MAKE} ${MAKE_BUILD_ARGS})
+    if(CMAKE_OSX_SYSROOT)
+      list(APPEND PROTOBUF_CONFIGURE_ARGS "SDKROOT=${CMAKE_OSX_SYSROOT}")
+      list(APPEND PROTOBUF_BUILD_COMMAND "SDKROOT=${CMAKE_OSX_SYSROOT}")
+    endif()
+    set(PROTOBUF_EXTERNAL_PROJECT_ADD_ARGS
+        CONFIGURE_COMMAND
+        "./configure"
+        ${PROTOBUF_CONFIGURE_ARGS}
+        BUILD_COMMAND
+        ${PROTOBUF_BUILD_COMMAND})
+  else()
+    set(PROTOBUF_CMAKE_ARGS
+        ${EP_COMMON_CMAKE_ARGS}
+        -DBUILD_SHARED_LIBS=OFF
+        -DCMAKE_INSTALL_LIBDIR=lib
+        "-DCMAKE_INSTALL_PREFIX=${PROTOBUF_PREFIX}"
+        -Dprotobuf_BUILD_TESTS=OFF
+        -Dprotobuf_DEBUG_POSTFIX=)
+    if(ZLIB_ROOT)
+      list(APPEND PROTOBUF_CMAKE_ARGS "-DZLIB_ROOT=${ZLIB_ROOT}")
+    endif()
+    set(PROTOBUF_EXTERNAL_PROJECT_ADD_ARGS CMAKE_ARGS ${PROTOBUF_CMAKE_ARGS} SOURCE_SUBDIR
+                                           "cmake")
   endif()
 
   externalproject_add(protobuf_ep
-                      CONFIGURE_COMMAND "./configure" ${PROTOBUF_CONFIGURE_ARGS}
-                      BUILD_COMMAND ${PROTOBUF_BUILD_COMMAND}
-                      BUILD_IN_SOURCE 1
-                      URL ${PROTOBUF_SOURCE_URL}
+                      ${PROTOBUF_EXTERNAL_PROJECT_ADD_ARGS}
                       BUILD_BYPRODUCTS "${PROTOBUF_STATIC_LIB}" "${PROTOBUF_COMPILER}"
-                                       ${EP_LOG_OPTIONS})
+                                       ${EP_LOG_OPTIONS}
+                      BUILD_IN_SOURCE 1
+                      URL ${PROTOBUF_SOURCE_URL})
 
   file(MAKE_DIRECTORY "${PROTOBUF_INCLUDE_DIR}")
 
@@ -1281,6 +1331,8 @@ macro(build_protobuf)
 
   add_dependencies(toolchain protobuf_ep)
   add_dependencies(arrow::protobuf::libprotobuf protobuf_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS arrow::protobuf::libprotobuf)
 endmacro()
 
 if(ARROW_WITH_PROTOBUF)
@@ -1294,7 +1346,7 @@ if(ARROW_WITH_PROTOBUF)
   else()
     set(ARROW_PROTOBUF_REQUIRED_VERSION "2.6.1")
   endif()
-  resolve_dependency_with_version(Protobuf ${ARROW_PROTOBUF_REQUIRED_VERSION})
+  resolve_dependency(Protobuf REQUIRED_VERSION ${ARROW_PROTOBUF_REQUIRED_VERSION})
 
   if(ARROW_PROTOBUF_USE_SHARED AND MSVC)
     add_definitions(-DPROTOBUF_USE_DLLS)
@@ -1383,6 +1435,7 @@ if(ARROW_JEMALLOC)
               "--with-jemalloc-prefix=je_arrow_"
               "--with-private-namespace=je_arrow_private_"
               "--without-export"
+              "--disable-shared"
               # Don't override operator new()
               "--disable-cxx" "--disable-libdl"
               # See https://github.com/jemalloc/jemalloc/issues/1237
@@ -1401,7 +1454,7 @@ if(ARROW_JEMALLOC)
     BUILD_IN_SOURCE 1
     BUILD_COMMAND ${JEMALLOC_BUILD_COMMAND}
     BUILD_BYPRODUCTS "${JEMALLOC_STATIC_LIB}"
-    INSTALL_COMMAND ${MAKE} install)
+    INSTALL_COMMAND ${MAKE} -j1 install)
 
   # Don't use the include directory directly so that we can point to a path
   # that is unique to our codebase.
@@ -1417,6 +1470,8 @@ if(ARROW_JEMALLOC)
                                    INTERFACE_INCLUDE_DIRECTORIES
                                    "${CMAKE_CURRENT_BINARY_DIR}/jemalloc_ep-prefix/src")
   add_dependencies(jemalloc::jemalloc jemalloc_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS jemalloc::jemalloc)
 endif()
 
 # ----------------------------------------------------------------------
@@ -1447,6 +1502,7 @@ if(ARROW_MIMALLOC)
       -DMI_OVERRIDE=OFF
       -DMI_LOCAL_DYNAMIC_TLS=ON
       -DMI_BUILD_OBJECT=OFF
+      -DMI_BUILD_SHARED=OFF
       -DMI_BUILD_TESTS=OFF)
 
   externalproject_add(mimalloc_ep
@@ -1467,6 +1523,8 @@ if(ARROW_MIMALLOC)
                                    "${MIMALLOC_INCLUDE_DIR}")
   add_dependencies(mimalloc::mimalloc mimalloc_ep)
   add_dependencies(toolchain mimalloc_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS mimalloc::mimalloc)
 endif()
 
 # ----------------------------------------------------------------------
@@ -1798,6 +1856,8 @@ macro(build_zlib)
 
   add_dependencies(toolchain zlib_ep)
   add_dependencies(ZLIB::ZLIB zlib_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS ZLIB::ZLIB)
 endmacro()
 
 if(ARROW_WITH_ZLIB)
@@ -1860,6 +1920,8 @@ macro(build_lz4)
                                    INTERFACE_INCLUDE_DIRECTORIES "${LZ4_PREFIX}/include")
   add_dependencies(toolchain lz4_ep)
   add_dependencies(LZ4::lz4 lz4_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS LZ4::lz4)
 endmacro()
 
 if(ARROW_WITH_LZ4)
@@ -1922,10 +1984,12 @@ macro(build_zstd)
 
   add_dependencies(toolchain zstd_ep)
   add_dependencies(zstd::libzstd zstd_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS zstd::libzstd)
 endmacro()
 
 if(ARROW_WITH_ZSTD)
-  resolve_dependency(ZSTD)
+  resolve_dependency(zstd)
 
   if(TARGET zstd::libzstd)
     set(ARROW_ZSTD_LIBZSTD zstd::libzstd)
@@ -1975,6 +2039,8 @@ macro(build_re2)
 
   add_dependencies(toolchain re2_ep)
   add_dependencies(RE2::re2 re2_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS RE2::re2)
 endmacro()
 
 if(ARROW_GANDIVA)
@@ -1998,7 +2064,8 @@ macro(build_bzip2)
                       ${EP_LOG_OPTIONS}
                       CONFIGURE_COMMAND ""
                       BUILD_IN_SOURCE 1
-                      BUILD_COMMAND ${MAKE} ${MAKE_BUILD_ARGS} ${BZIP2_EXTRA_ARGS}
+                      BUILD_COMMAND ${MAKE} libbz2.a ${MAKE_BUILD_ARGS}
+                                    ${BZIP2_EXTRA_ARGS}
                       INSTALL_COMMAND ${MAKE} install PREFIX=${BZIP2_PREFIX}
                                       ${BZIP2_EXTRA_ARGS}
                       INSTALL_DIR ${BZIP2_PREFIX}
@@ -2015,6 +2082,8 @@ macro(build_bzip2)
 
   add_dependencies(toolchain bzip2_ep)
   add_dependencies(BZip2::BZip2 bzip2_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS BZip2::BZip2)
 endmacro()
 
 if(ARROW_WITH_BZ2)
@@ -2046,7 +2115,7 @@ macro(build_utf8proc)
       "-DCMAKE_INSTALL_PREFIX=${UTF8PROC_PREFIX}"
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
       -DCMAKE_INSTALL_LIBDIR=lib
-      -DDBUILD_SHARED_LIBS=OFF)
+      -DBUILD_SHARED_LIBS=OFF)
 
   externalproject_add(utf8proc_ep
                       ${EP_LOG_OPTIONS}
@@ -2067,10 +2136,14 @@ macro(build_utf8proc)
 
   add_dependencies(toolchain utf8proc_ep)
   add_dependencies(utf8proc::utf8proc utf8proc_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS utf8proc::utf8proc)
 endmacro()
 
 if(ARROW_WITH_UTF8PROC)
   resolve_dependency(utf8proc)
+
+  add_definitions(-DARROW_WITH_UTF8PROC)
 
   # TODO: Don't use global definitions but rather
   # target_compile_definitions or target_link_libraries
@@ -2120,8 +2193,11 @@ macro(build_cares)
   set_target_properties(c-ares::cares
                         PROPERTIES IMPORTED_LOCATION "${CARES_STATIC_LIB}"
                                    INTERFACE_INCLUDE_DIRECTORIES "${CARES_INCLUDE_DIR}")
+  add_dependencies(c-ares::cares cares_ep)
 
   set(CARES_VENDORED TRUE)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS c-ares::cares)
 endmacro()
 
 if(ARROW_WITH_GRPC)
@@ -2344,6 +2420,39 @@ macro(build_grpc)
   add_dependencies(gRPC::grpc++ grpc_ep)
   add_dependencies(gRPC::grpc_cpp_plugin grpc_ep)
   set(GRPC_VENDORED TRUE)
+
+  # ar -M rejects with the "libgrpc++.a" filename because "+" is a line
+  # continuation character in these scripts, so we have to create a copy of the
+  # static lib that we will bundle later
+
+  set(
+    GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR
+    "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}grpcpp${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    )
+  add_custom_command(OUTPUT ${GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR}
+                     COMMAND ${CMAKE_COMMAND}
+                             -E
+                             copy
+                             $<TARGET_FILE:gRPC::grpc++>
+                             ${GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR}
+                     DEPENDS grpc_ep)
+  add_library(gRPC::grpcpp_for_bundling STATIC IMPORTED)
+  set_target_properties(gRPC::grpcpp_for_bundling
+                        PROPERTIES IMPORTED_LOCATION
+                                   "${GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR}")
+
+  set_source_files_properties("${GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR}" PROPERTIES GENERATED
+                              TRUE)
+  add_custom_target(grpc_copy_grpc++ ALL DEPENDS "${GRPC_STATIC_LIBRARY_GRPCPP_FOR_AR}")
+  add_dependencies(gRPC::grpcpp_for_bundling grpc_copy_grpc++)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS
+              ${ABSL_LIBRARIES}
+              gRPC::upb
+              gRPC::gpr
+              gRPC::grpc
+              gRPC::address_sorting
+              gRPC::grpcpp_for_bundling)
 endmacro()
 
 if(ARROW_WITH_GRPC)
@@ -2488,6 +2597,8 @@ macro(build_orc)
 
   add_dependencies(toolchain orc_ep)
   add_dependencies(orc::liborc orc_ep)
+
+  list(APPEND ARROW_BUNDLED_STATIC_LIBS orc::liborc)
 endmacro()
 
 if(ARROW_ORC)
@@ -2521,7 +2632,7 @@ macro(build_awssdk)
   set(AWSSDK_CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_INSTALL_LIBDIR=lib
-      -DBUILD_ONLY=s3;core;config
+      -DBUILD_ONLY=s3;core;config;identity-management;sts
       -DENABLE_UNITY_BUILD=on
       -DENABLE_TESTING=off
       "-DCMAKE_C_FLAGS=${EP_C_FLAGS}"
@@ -2535,7 +2646,16 @@ macro(build_awssdk)
     AWSSDK_S3_SHARED_LIB
     "${AWSSDK_PREFIX}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}aws-cpp-sdk-s3${CMAKE_SHARED_LIBRARY_SUFFIX}"
     )
-  set(AWSSDK_SHARED_LIBS "${AWSSDK_CORE_SHARED_LIB}" "${AWSSDK_S3_SHARED_LIB}")
+  set(
+    AWSSDK_IAM_SHARED_LIB
+    "${AWSSDK_PREFIX}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}aws-cpp-sdk-identity-management${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    )
+  set(
+    AWSSDK_STS_SHARED_LIB
+    "${AWSSDK_PREFIX}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}aws-cpp-sdk-sts${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    )
+  set(AWSSDK_SHARED_LIBS "${AWSSDK_CORE_SHARED_LIB}" "${AWSSDK_S3_SHARED_LIB}"
+                         "${AWSSDK_IAM_SHARED_LIB}" "${AWSSDK_STS_SHARED_LIB}")
 
   externalproject_add(awssdk_ep
                       ${EP_LOG_OPTIONS}
@@ -2548,6 +2668,8 @@ macro(build_awssdk)
   add_dependencies(toolchain awssdk_ep)
   set(AWSSDK_LINK_LIBRARIES ${AWSSDK_SHARED_LIBS})
   set(AWSSDK_VENDORED TRUE)
+
+  # AWSSDK is shared-only build
 endmacro()
 
 if(ARROW_S3)
@@ -2555,14 +2677,24 @@ if(ARROW_S3)
 
   # Need to customize the find_package() call, so cannot call resolve_dependency()
   if(AWSSDK_SOURCE STREQUAL "AUTO")
-    find_package(AWSSDK COMPONENTS config s3 transfer)
+    find_package(AWSSDK
+                 COMPONENTS config
+                            s3
+                            transfer
+                            identity-management
+                            sts)
     if(NOT AWSSDK_FOUND)
       build_awssdk()
     endif()
   elseif(AWSSDK_SOURCE STREQUAL "BUNDLED")
     build_awssdk()
   elseif(AWSSDK_SOURCE STREQUAL "SYSTEM")
-    find_package(AWSSDK REQUIRED COMPONENTS config s3 transfer)
+    find_package(AWSSDK REQUIRED
+                 COMPONENTS config
+                            s3
+                            transfer
+                            identity-management
+                            sts)
   endif()
 
   include_directories(SYSTEM ${AWSSDK_INCLUDE_DIR})
@@ -2580,8 +2712,10 @@ if(ARROW_S3)
   endif()
 endif()
 
+message(STATUS "All bundled static libraries: ${ARROW_BUNDLED_STATIC_LIBS}")
+
 # Write out the package configurations.
 
-configure_file("src/arrow/util/config.h.cmake" "src/arrow/util/config.h")
+configure_file("src/arrow/util/config.h.cmake" "src/arrow/util/config.h" ESCAPE_QUOTES)
 install(FILES "${ARROW_BINARY_DIR}/src/arrow/util/config.h"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/arrow/util")

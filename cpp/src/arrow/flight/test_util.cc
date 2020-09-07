@@ -26,19 +26,17 @@
 #include <sstream>
 
 #include <boost/filesystem.hpp>
-// boost/process/detail/windows/handle_workaround.hpp doesn't work
-// without BOOST_USE_WINDOWS_H with MinGW because MinGW doesn't
-// provide __kernel_entry without winternl.h.
-//
-// See also:
-// https://github.com/boostorg/process/blob/develop/include/boost/process/detail/windows/handle_workaround.hpp
-#define BOOST_USE_WINDOWS_H 1
+// We need BOOST_USE_WINDOWS_H definition with MinGW when we use
+// boost/process.hpp. See ARROW_BOOST_PROCESS_COMPILE_DEFINITIONS in
+// cpp/cmake_modules/BuildUtils.cmake for details.
 #include <boost/process.hpp>
 
 #include <gtest/gtest.h>
 
 #include "arrow/ipc/test_common.h"
+#include "arrow/testing/generator.h"
 #include "arrow/testing/gtest_util.h"
+#include "arrow/testing/util.h"
 #include "arrow/util/logging.h"
 
 #include "arrow/flight/api.h"
@@ -145,13 +143,23 @@ Status GetBatchForFlight(const Ticket& ticket, std::shared_ptr<RecordBatchReader
     RETURN_NOT_OK(ExampleIntBatches(&batches));
     *out = std::make_shared<BatchIterator>(batches[0]->schema(), batches);
     return Status::OK();
+  } else if (ticket.ticket == "ticket-floats-1") {
+    BatchVector batches;
+    RETURN_NOT_OK(ExampleFloatBatches(&batches));
+    *out = std::make_shared<BatchIterator>(batches[0]->schema(), batches);
+    return Status::OK();
   } else if (ticket.ticket == "ticket-dicts-1") {
     BatchVector batches;
     RETURN_NOT_OK(ExampleDictBatches(&batches));
     *out = std::make_shared<BatchIterator>(batches[0]->schema(), batches);
     return Status::OK();
+  } else if (ticket.ticket == "ticket-large-batch-1") {
+    BatchVector batches;
+    RETURN_NOT_OK(ExampleLargeBatches(&batches));
+    *out = std::make_shared<BatchIterator>(batches[0]->schema(), batches);
+    return Status::OK();
   } else {
-    return Status::NotImplemented("no stream implemented for this ticket");
+    return Status::NotImplemented("no stream implemented for ticket: " + ticket.ticket);
   }
 }
 
@@ -468,9 +476,22 @@ Status NumberingStream::Next(FlightPayload* payload) {
 }
 
 std::shared_ptr<Schema> ExampleIntSchema() {
-  auto f0 = field("f0", int32());
-  auto f1 = field("f1", int32());
-  return ::arrow::schema({f0, f1});
+  auto f0 = field("f0", int8());
+  auto f1 = field("f1", uint8());
+  auto f2 = field("f2", int16());
+  auto f3 = field("f3", uint16());
+  auto f4 = field("f4", int32());
+  auto f5 = field("f5", uint32());
+  auto f6 = field("f6", int64());
+  auto f7 = field("f7", uint64());
+  return ::arrow::schema({f0, f1, f2, f3, f4, f5, f6, f7});
+}
+
+std::shared_ptr<Schema> ExampleFloatSchema() {
+  auto f0 = field("f0", float16());
+  auto f1 = field("f1", float32());
+  auto f2 = field("f2", float64());
+  return ::arrow::schema({f0, f1, f2});
 }
 
 std::shared_ptr<Schema> ExampleStringSchema() {
@@ -485,36 +506,52 @@ std::shared_ptr<Schema> ExampleDictSchema() {
   return batch->schema();
 }
 
+std::shared_ptr<Schema> ExampleLargeSchema() {
+  std::vector<std::shared_ptr<arrow::Field>> fields;
+  for (int i = 0; i < 128; i++) {
+    const auto field_name = "f" + std::to_string(i);
+    fields.push_back(arrow::field(field_name, arrow::float64()));
+  }
+  return arrow::schema(fields);
+}
+
 std::vector<FlightInfo> ExampleFlightInfo() {
   Location location1;
   Location location2;
   Location location3;
   Location location4;
+  Location location5;
   ARROW_EXPECT_OK(Location::ForGrpcTcp("foo1.bar.com", 12345, &location1));
   ARROW_EXPECT_OK(Location::ForGrpcTcp("foo2.bar.com", 12345, &location2));
   ARROW_EXPECT_OK(Location::ForGrpcTcp("foo3.bar.com", 12345, &location3));
   ARROW_EXPECT_OK(Location::ForGrpcTcp("foo4.bar.com", 12345, &location4));
+  ARROW_EXPECT_OK(Location::ForGrpcTcp("foo5.bar.com", 12345, &location5));
 
-  FlightInfo::Data flight1, flight2, flight3;
+  FlightInfo::Data flight1, flight2, flight3, flight4;
 
   FlightEndpoint endpoint1({{"ticket-ints-1"}, {location1}});
   FlightEndpoint endpoint2({{"ticket-ints-2"}, {location2}});
   FlightEndpoint endpoint3({{"ticket-cmd"}, {location3}});
   FlightEndpoint endpoint4({{"ticket-dicts-1"}, {location4}});
+  FlightEndpoint endpoint5({{"ticket-floats-1"}, {location5}});
 
   FlightDescriptor descr1{FlightDescriptor::PATH, "", {"examples", "ints"}};
   FlightDescriptor descr2{FlightDescriptor::CMD, "my_command", {}};
   FlightDescriptor descr3{FlightDescriptor::PATH, "", {"examples", "dicts"}};
+  FlightDescriptor descr4{FlightDescriptor::PATH, "", {"examples", "floats"}};
 
   auto schema1 = ExampleIntSchema();
   auto schema2 = ExampleStringSchema();
   auto schema3 = ExampleDictSchema();
+  auto schema4 = ExampleFloatSchema();
 
   ARROW_EXPECT_OK(
       MakeFlightInfo(*schema1, descr1, {endpoint1, endpoint2}, 1000, 100000, &flight1));
   ARROW_EXPECT_OK(MakeFlightInfo(*schema2, descr2, {endpoint3}, 1000, 100000, &flight2));
   ARROW_EXPECT_OK(MakeFlightInfo(*schema3, descr3, {endpoint4}, -1, -1, &flight3));
-  return {FlightInfo(flight1), FlightInfo(flight2), FlightInfo(flight3)};
+  ARROW_EXPECT_OK(MakeFlightInfo(*schema4, descr4, {endpoint5}, 1000, 100000, &flight4));
+  return {FlightInfo(flight1), FlightInfo(flight2), FlightInfo(flight3),
+          FlightInfo(flight4)};
 }
 
 Status ExampleIntBatches(BatchVector* out) {
@@ -527,6 +564,16 @@ Status ExampleIntBatches(BatchVector* out) {
   return Status::OK();
 }
 
+Status ExampleFloatBatches(BatchVector* out) {
+  std::shared_ptr<RecordBatch> batch;
+  for (int i = 0; i < 5; ++i) {
+    // Make all different sizes, use different random seed
+    RETURN_NOT_OK(ipc::test::MakeFloatBatchSized(10 + i, &batch, i));
+    out->push_back(batch);
+  }
+  return Status::OK();
+}
+
 Status ExampleDictBatches(BatchVector* out) {
   // Just the same batch, repeated a few times
   std::shared_ptr<RecordBatch> batch;
@@ -534,6 +581,29 @@ Status ExampleDictBatches(BatchVector* out) {
     RETURN_NOT_OK(ipc::test::MakeDictionary(&batch));
     out->push_back(batch);
   }
+  return Status::OK();
+}
+
+Status ExampleNestedBatches(BatchVector* out) {
+  std::shared_ptr<RecordBatch> batch;
+  for (int i = 0; i < 3; ++i) {
+    RETURN_NOT_OK(ipc::test::MakeListRecordBatch(&batch));
+    out->push_back(batch);
+  }
+  return Status::OK();
+}
+
+Status ExampleLargeBatches(BatchVector* out) {
+  const auto array_length = 32768;
+  std::shared_ptr<RecordBatch> batch;
+  std::vector<std::shared_ptr<arrow::Array>> arrays;
+  const auto arr = arrow::ConstantArrayGenerator::Float64(array_length, 1.0);
+  for (int i = 0; i < 128; i++) {
+    arrays.push_back(arr);
+  }
+  auto schema = ExampleLargeSchema();
+  out->push_back(RecordBatch::Make(schema, array_length, arrays));
+  out->push_back(RecordBatch::Make(schema, array_length, arrays));
   return Status::OK();
 }
 
@@ -639,16 +709,6 @@ Status TestClientBasicAuthHandler::Authenticate(ClientAuthSender* outgoing,
 
 Status TestClientBasicAuthHandler::GetToken(std::string* token) {
   *token = token_;
-  return Status::OK();
-}
-
-Status GetTestResourceRoot(std::string* out) {
-  const char* c_root = std::getenv("ARROW_TEST_DATA");
-  if (!c_root) {
-    return Status::IOError(
-        "Test resources not found, set ARROW_TEST_DATA to <repo root>/testing/data");
-  }
-  *out = std::string(c_root);
   return Status::OK();
 }
 

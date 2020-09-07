@@ -70,6 +70,9 @@ PYTHON_INTERPRETER="${CPYTHON_PATH}/bin/python"
 PIP="${CPYTHON_PATH}/bin/pip"
 PATH="${PATH}:${CPYTHON_PATH}"
 
+# Will be "manylinux2010" or "manylinux2014"
+manylinux_kind=$(${PYTHON_INTERPRETER} -c "import os; print(os.environ['AUDITWHEEL_PLAT'].split('_')[0], end='')")
+
 # XXX The Docker image doesn't include Python libs, this confuses CMake
 # (https://github.com/pypa/manylinux/issues/484)
 py_libname=$(${PYTHON_INTERPRETER} -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))")
@@ -95,32 +98,34 @@ mkdir -p "${ARROW_BUILD_DIR}"
 pushd "${ARROW_BUILD_DIR}"
 PATH="${CPYTHON_PATH}/bin:${PATH}" cmake \
     -DARROW_BOOST_USE_SHARED=ON \
+    -DARROW_BROTLI_USE_SHARED=OFF \
     -DARROW_BUILD_SHARED=ON \
     -DARROW_BUILD_STATIC=OFF \
     -DARROW_BUILD_TESTS=OFF \
     -DARROW_DATASET=${BUILD_ARROW_DATASET} \
     -DARROW_DEPENDENCY_SOURCE="SYSTEM" \
+    -DARROW_DEPENDENCY_USE_SHARED=OFF \
     -DARROW_FLIGHT=${BUILD_ARROW_FLIGHT} \
     -DARROW_GANDIVA_JAVA=OFF \
     -DARROW_GANDIVA_PC_CXX_FLAGS="-isystem;/opt/rh/devtoolset-8/root/usr/include/c++/8/;-isystem;/opt/rh/devtoolset-8/root/usr/include/c++/8/x86_64-redhat-linux/" \
     -DARROW_GANDIVA=${BUILD_ARROW_GANDIVA} \
-    -DARROW_GRPC_USE_SHARED=OFF \
     -DARROW_HDFS=ON \
     -DARROW_JEMALLOC=ON \
     -DARROW_ORC=OFF \
+    -DARROW_PACKAGE_KIND=${manylinux_kind} \
     -DARROW_PARQUET=ON \
     -DARROW_PLASMA=ON \
     -DARROW_PYTHON=ON \
     -DARROW_RPATH_ORIGIN=ON \
     -DARROW_S3=ON \
     -DARROW_TENSORFLOW=ON \
+    -DARROW_UTF8PROC_USE_SHARED=OFF \
     -DARROW_WITH_BROTLI=ON \
     -DARROW_WITH_BZ2=ON \
     -DARROW_WITH_LZ4=ON \
     -DARROW_WITH_SNAPPY=ON \
     -DARROW_WITH_ZLIB=ON \
     -DARROW_WITH_ZSTD=ON \
-    -DARROW_ZSTD_USE_SHARED=OFF \
     -DBoost_NAMESPACE=arrow_boost \
     -DBOOST_ROOT=/arrow_boost_dist \
     -DCMAKE_BUILD_TYPE=Release \

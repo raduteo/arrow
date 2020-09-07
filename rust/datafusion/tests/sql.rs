@@ -22,16 +22,14 @@ extern crate arrow;
 extern crate datafusion;
 
 use arrow::array::*;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-use datafusion::datasource::csv::CsvReadOptions;
+use datafusion::datasource::{csv::CsvReadOptions, MemTable};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionContext;
-use datafusion::execution::physical_plan::udf::ScalarFunction;
-use datafusion::logicalplan::LogicalPlan;
-
-const DEFAULT_BATCH_SIZE: usize = 1024 * 1024;
+use datafusion::logical_plan::LogicalPlan;
+use datafusion::physical_plan::udf::ScalarFunction;
 
 #[test]
 fn nyc() -> Result<()> {
@@ -111,8 +109,8 @@ fn parquet_single_nan_schema() {
     let sql = "SELECT mycol FROM single_nan";
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
-    let results = ctx.collect(plan.as_ref()).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
+    let results = ctx.collect(plan).unwrap();
     for batch in results {
         assert_eq!(1, batch.num_rows());
         assert_eq!(1, batch.num_columns());
@@ -154,6 +152,44 @@ fn csv_query_group_by_int_min_max() -> Result<()> {
 }
 
 #[test]
+fn csv_query_group_by_two_columns() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c1, c2, MIN(c3) FROM aggregate_test_100 GROUP BY c1, c2";
+    let mut actual = execute(&mut ctx, sql);
+    actual.sort();
+    let expected = [
+        "\"a\"\t1\t-85",
+        "\"a\"\t2\t-48",
+        "\"a\"\t3\t-72",
+        "\"a\"\t4\t-101",
+        "\"a\"\t5\t-101",
+        "\"b\"\t1\t12",
+        "\"b\"\t2\t-60",
+        "\"b\"\t3\t-101",
+        "\"b\"\t4\t-117",
+        "\"b\"\t5\t-82",
+        "\"c\"\t1\t-24",
+        "\"c\"\t2\t-117",
+        "\"c\"\t3\t-2",
+        "\"c\"\t4\t-90",
+        "\"c\"\t5\t-94",
+        "\"d\"\t1\t-99",
+        "\"d\"\t2\t93",
+        "\"d\"\t3\t-76",
+        "\"d\"\t4\t5",
+        "\"d\"\t5\t-59",
+        "\"e\"\t1\t36",
+        "\"e\"\t2\t-61",
+        "\"e\"\t3\t-95",
+        "\"e\"\t4\t-56",
+        "\"e\"\t5\t-86",
+    ];
+    assert_eq!(expected.join("\n"), actual.join("\n"));
+    Ok(())
+}
+
+#[test]
 fn csv_query_avg_sqrt() -> Result<()> {
     let mut ctx = create_ctx()?;
     register_aggregate_csv(&mut ctx)?;
@@ -165,15 +201,57 @@ fn csv_query_avg_sqrt() -> Result<()> {
     Ok(())
 }
 
+/// sqrt(f32) is sligthly different than sqrt(CAST(f32 AS double)))
+#[test]
+fn sqrt_f32_vs_f64() -> Result<()> {
+    let mut ctx = create_ctx()?;
+    register_aggregate_csv(&mut ctx)?;
+    // sqrt(f32)'s plan passes
+    let sql = "SELECT avg(sqrt(c11)) FROM aggregate_test_100";
+    let actual = &execute(&mut ctx, sql)[0];
+    let expected = "0.6584408485889435".to_string();
+
+    assert_eq!(*actual, expected);
+    let sql = "SELECT avg(sqrt(CAST(c11 AS double))) FROM aggregate_test_100";
+    let actual = &execute(&mut ctx, sql)[0];
+    let expected = "0.6584408483418833".to_string();
+    assert_eq!(*actual, expected);
+    Ok(())
+}
+
+#[test]
+fn csv_query_error() -> Result<()> {
+    // sin(utf8) should error
+    let mut ctx = create_ctx()?;
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT sin(c1) FROM aggregate_test_100";
+    let plan = ctx.create_logical_plan(&sql);
+    assert!(plan.is_err());
+    Ok(())
+}
+
+// this query used to deadlock due to the call udf(udf())
+#[test]
+fn csv_query_sqrt_sqrt() -> Result<()> {
+    let mut ctx = create_ctx()?;
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT sqrt(sqrt(c12)) FROM aggregate_test_100 LIMIT 1";
+    let actual = execute(&mut ctx, sql);
+    // sqrt(sqrt(c12=0.9294097332465232)) = 0.9818650561397431
+    let expected = "0.9818650561397431".to_string();
+    assert_eq!(actual.join("\n"), expected);
+    Ok(())
+}
+
 fn create_ctx() -> Result<ExecutionContext> {
     let mut ctx = ExecutionContext::new();
 
     // register a custom UDF
     ctx.register_udf(ScalarFunction::new(
         "custom_sqrt",
-        vec![Field::new("n", DataType::Float64, true)],
+        vec![DataType::Float64],
         DataType::Float64,
-        custom_sqrt,
+        Arc::new(custom_sqrt),
     ));
 
     Ok(ctx)
@@ -239,8 +317,8 @@ fn csv_query_avg_multi_batch() -> Result<()> {
     let sql = "SELECT avg(c12) FROM aggregate_test_100";
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
-    let results = ctx.collect(plan.as_ref()).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
+    let results = ctx.collect(plan).unwrap();
     let batch = &results[0];
     let column = batch.column(0);
     let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -279,7 +357,7 @@ fn csv_query_group_by_int_count() -> Result<()> {
 fn csv_query_group_by_string_min_max() -> Result<()> {
     let mut ctx = ExecutionContext::new();
     register_aggregate_csv(&mut ctx)?;
-    let sql = "SELECT c2, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c1";
+    let sql = "SELECT c1, MIN(c12), MAX(c12) FROM aggregate_test_100 GROUP BY c1";
     let mut actual = execute(&mut ctx, sql);
     actual.sort();
     let expected =
@@ -394,7 +472,37 @@ fn csv_query_count_one() {
     assert_eq!(expected, actual);
 }
 
-fn aggr_test_schema() -> Arc<Schema> {
+#[test]
+fn csv_explain() {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    let sql = "EXPLAIN SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    let expected = "\"logical_plan\"\t\"Projection: #c1\\n  Filter: #c2 Gt Int64(10)\\n    TableScan: aggregate_test_100 projection=None\"".to_string();
+    assert_eq!(expected, actual);
+
+    // Also, expect same result with lowercase explain
+    let sql = "explain SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    assert_eq!(expected, actual);
+}
+
+#[test]
+fn csv_explain_verbose() {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    let sql = "EXPLAIN VERBOSE SELECT c1 FROM aggregate_test_100 where c2 > 10";
+    let actual = execute(&mut ctx, sql).join("\n");
+    // Don't actually test the contents of the debuging output (as
+    // that may change and keeping this test updated will be a
+    // pain). Instead just check for a few key pieces.
+    assert!(actual.contains("logical_plan"), "Actual: '{}'", actual);
+    assert!(actual.contains("physical_plan"), "Actual: '{}'", actual);
+    assert!(actual.contains("type_coercion"), "Actual: '{}'", actual);
+    assert!(actual.contains("#c2 Gt Int64(10)"), "Actual: '{}'", actual);
+}
+
+fn aggr_test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("c1", DataType::Utf8, false),
         Field::new("c2", DataType::UInt32, false),
@@ -417,8 +525,8 @@ fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
 
     // TODO: The following c9 should be migrated to UInt32 and c10 should be UInt64 once
     // unsigned is supported.
-    ctx.sql(
-        &format!(
+    let df = ctx
+        .sql(&format!(
             "
     CREATE EXTERNAL TABLE aggregate_test_100 (
         c1  VARCHAR NOT NULL,
@@ -440,10 +548,16 @@ fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
     LOCATION '{}/csv/aggregate_test_100.csv'
     ",
             testdata
-        ),
-        1024,
-    )
-    .unwrap();
+        ))
+        .expect("Creating dataframe for CREATE EXTERNAL TABLE");
+
+    // Mimic the CLI and execute the resulting plan -- even though it
+    // is effectively a no-op (returns zero rows)
+    let results = df.collect().expect("Executing CREATE EXTERNAL TABLE");
+    assert!(
+        results.is_empty(),
+        "Expected no rows from executing CREATE EXTERNAL TABLE"
+    );
 }
 
 fn register_aggregate_csv(ctx: &mut ExecutionContext) -> Result<()> {
@@ -469,9 +583,16 @@ fn register_alltypes_parquet(ctx: &mut ExecutionContext) {
 /// Execute query and return result set as tab delimited string
 fn execute(ctx: &mut ExecutionContext, sql: &str) -> Vec<String> {
     let plan = ctx.create_logical_plan(&sql).unwrap();
+    let logical_schema = plan.schema().clone();
     let plan = ctx.optimize(&plan).unwrap();
-    let plan = ctx.create_physical_plan(&plan, DEFAULT_BATCH_SIZE).unwrap();
-    let results = ctx.collect(plan.as_ref()).unwrap();
+    let optimized_logical_schema = plan.schema().clone();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
+    let physical_schema = plan.schema().clone();
+    let results = ctx.collect(plan).unwrap();
+
+    assert_eq!(logical_schema.as_ref(), optimized_logical_schema.as_ref());
+    assert_eq!(logical_schema.as_ref(), physical_schema.as_ref());
+
     result_str(&results)
 }
 
@@ -535,6 +656,17 @@ fn result_str(results: &[RecordBatch]) -> Vec<String> {
                     DataType::Utf8 => {
                         let array =
                             column.as_any().downcast_ref::<StringArray>().unwrap();
+                        let s = if array.is_null(row_index) {
+                            "NULL"
+                        } else {
+                            array.value(row_index)
+                        };
+
+                        str.push_str(&format!("{:?}", s));
+                    }
+                    DataType::Boolean => {
+                        let array =
+                            column.as_any().downcast_ref::<BooleanArray>().unwrap();
                         let s = array.value(row_index);
 
                         str.push_str(&format!("{:?}", s));
@@ -546,4 +678,73 @@ fn result_str(results: &[RecordBatch]) -> Vec<String> {
         }
     }
     result
+}
+
+#[test]
+fn query_length() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8, false)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["", "a", "aa", "aaa"]))],
+    )?;
+
+    let table = MemTable::new(schema, vec![vec![data]])?;
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Box::new(table));
+    let sql = "SELECT length(c1) FROM test";
+    let actual = execute(&mut ctx, sql).join("\n");
+    let expected = "0\n1\n2\n3".to_string();
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[test]
+fn query_concat() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c1", DataType::Utf8, false),
+        Field::new("c2", DataType::Int32, true),
+    ]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["", "a", "aa", "aaa"])),
+            Arc::new(Int32Array::from(vec![Some(0), Some(1), None, Some(3)])),
+        ],
+    )?;
+
+    let table = MemTable::new(schema, vec![vec![data]])?;
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Box::new(table));
+    let sql = "SELECT concat(c1, '-hi-', cast(c2 as varchar)) FROM test";
+    let actual = execute(&mut ctx, sql);
+    let expected = vec!["\"-hi-0\"", "\"a-hi-1\"", "\"NULL\"", "\"aaa-hi-3\""];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[test]
+fn csv_query_sum_cast() {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    // c8 = i32; c9 = i64
+    let sql = "SELECT c8 + c9 FROM aggregate_test_100";
+    // check that the physical and logical schemas are equal
+    execute(&mut ctx, sql);
+}
+
+#[test]
+fn like() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx);
+    let sql = "SELECT COUNT(c1) FROM aggregate_test_100 WHERE c13 LIKE '%FB%'";
+    // check that the physical and logical schemas are equal
+    let actual = execute(&mut ctx, sql).join("\n");
+
+    let expected = "1".to_string();
+    assert_eq!(expected, actual);
+    Ok(())
 }

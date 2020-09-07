@@ -44,7 +44,29 @@ cdef extern from "arrow/util/key_value_metadata.h" namespace "arrow" nogil:
         c_bool Contains(const c_string& key) const
 
 
+cdef extern from "arrow/util/decimal.h" namespace "arrow" nogil:
+    cdef cppclass CDecimal128" arrow::Decimal128":
+        c_string ToString(int32_t scale) const
+
+
 cdef extern from "arrow/api.h" namespace "arrow" nogil:
+
+    cdef cppclass CBuildInfo "arrow::BuildInfo":
+        int version
+        int version_major
+        int version_minor
+        int version_patch
+        c_string version_string
+        c_string so_version
+        c_string full_so_version
+        c_string compiler_id
+        c_string compiler_version
+        c_string compiler_flags
+        c_string git_id
+        c_string git_description
+        c_string package_kind
+
+    const CBuildInfo& GetBuildInfo()
 
     enum Type" arrow::Type::type":
         _Type_NA" arrow::Type::NA"
@@ -165,6 +187,8 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
 
         int num_fields()
 
+        CResult[shared_ptr[CScalar]] GetScalar(int64_t i) const
+
         c_string Diff(const CArray& other)
         c_bool Equals(const CArray& arr)
         c_bool IsNull(int i)
@@ -181,6 +205,9 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
     shared_ptr[CArray] MakeArray(const shared_ptr[CArrayData]& data)
     CResult[shared_ptr[CArray]] MakeArrayOfNull(
         const shared_ptr[CDataType]& type, int64_t length, CMemoryPool* pool)
+
+    CResult[shared_ptr[CArray]] MakeArrayFromScalar(
+        const CScalar& scalar, int64_t length, CMemoryPool* pool)
 
     CStatus DebugPrint(const CArray& arr, int indent)
 
@@ -362,6 +389,11 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         shared_ptr[CField] WithNullable(c_bool nullable)
         vector[shared_ptr[CField]] Flatten()
 
+    cdef cppclass CFieldRef" arrow::FieldRef":
+        CFieldRef()
+        CFieldRef(c_string name)
+        CFieldRef(int index)
+
     cdef cppclass CStructType" arrow::StructType"(CDataType):
         CStructType(const vector[shared_ptr[CField]]& fields)
 
@@ -519,7 +551,6 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         int32_t value_length(int i)
         shared_ptr[CArray] values()
         shared_ptr[CArray] offsets()
-        CResult[shared_ptr[CArray]] Flatten(CMemoryPool* memory_pool)
         shared_ptr[CDataType] value_type()
 
     cdef cppclass CLargeListArray" arrow::LargeListArray"(CArray):
@@ -531,7 +562,6 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         int64_t value_length(int i)
         shared_ptr[CArray] values()
         shared_ptr[CArray] offsets()
-        CResult[shared_ptr[CArray]] Flatten(CMemoryPool* memory_pool)
         shared_ptr[CDataType] value_type()
 
     cdef cppclass CFixedSizeListArray" arrow::FixedSizeListArray"(CArray):
@@ -593,12 +623,14 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         shared_ptr[CBuffer] value_data()
         int32_t value_offset(int64_t i)
         int32_t value_length(int64_t i)
+        int32_t total_values_length()
 
     cdef cppclass CLargeBinaryArray" arrow::LargeBinaryArray"(CArray):
         const uint8_t* GetValue(int i, int64_t* length)
         shared_ptr[CBuffer] value_data()
         int64_t value_offset(int64_t i)
         int64_t value_length(int64_t i)
+        int64_t total_values_length()
 
     cdef cppclass CStringArray" arrow::StringArray"(CBinaryArray):
         CStringArray(int64_t length, shared_ptr[CBuffer] value_offsets,
@@ -734,6 +766,7 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
 
         vector[c_string] ColumnNames()
         CResult[shared_ptr[CTable]] RenameColumns(const vector[c_string]&)
+        CResult[shared_ptr[CTable]] SelectColumns(const vector[int]&)
 
         CResult[shared_ptr[CTable]] Flatten(CMemoryPool* pool)
 
@@ -774,10 +807,18 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         Type type_id()
         c_bool Equals(const CTensor& other)
 
+    cdef cppclass CSparseIndex" arrow::SparseIndex":
+        pass
+
+    cdef cppclass CSparseCOOIndex" arrow::SparseCOOIndex":
+        c_bool is_canonical()
+
     cdef cppclass CSparseCOOTensor" arrow::SparseCOOTensor":
         shared_ptr[CDataType] type()
         shared_ptr[CBuffer] data()
-        CStatus ToTensor(shared_ptr[CTensor]*)
+        CResult[shared_ptr[CTensor]] ToTensor()
+
+        shared_ptr[CSparseIndex] sparse_index()
 
         const vector[int64_t]& shape()
         int64_t size()
@@ -794,7 +835,7 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
     cdef cppclass CSparseCSRMatrix" arrow::SparseCSRMatrix":
         shared_ptr[CDataType] type()
         shared_ptr[CBuffer] data()
-        CStatus ToTensor(shared_ptr[CTensor]*)
+        CResult[shared_ptr[CTensor]] ToTensor()
 
         const vector[int64_t]& shape()
         int64_t size()
@@ -811,7 +852,7 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
     cdef cppclass CSparseCSCMatrix" arrow::SparseCSCMatrix":
         shared_ptr[CDataType] type()
         shared_ptr[CBuffer] data()
-        CStatus ToTensor(shared_ptr[CTensor]*)
+        CResult[shared_ptr[CTensor]] ToTensor()
 
         const vector[int64_t]& shape()
         int64_t size()
@@ -828,7 +869,7 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
     cdef cppclass CSparseCSFTensor" arrow::SparseCSFTensor":
         shared_ptr[CDataType] type()
         shared_ptr[CBuffer] data()
-        CStatus ToTensor(shared_ptr[CTensor]*)
+        CResult[shared_ptr[CTensor]] ToTensor()
 
         const vector[int64_t]& shape()
         int64_t size()
@@ -846,6 +887,11 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
         shared_ptr[CDataType] type
         c_bool is_valid
         c_string ToString() const
+        c_bool Equals(const CScalar& other) const
+        CResult[shared_ptr[CScalar]] CastTo(shared_ptr[CDataType] to) const
+
+    cdef cppclass CScalarHash" arrow::Scalar::Hash":
+        size_t operator()(const shared_ptr[CScalar]& scalar) const
 
     cdef cppclass CNullScalar" arrow::NullScalar"(CScalar):
         CNullScalar()
@@ -877,17 +923,64 @@ cdef extern from "arrow/api.h" namespace "arrow" nogil:
     cdef cppclass CUInt64Scalar" arrow::UInt64Scalar"(CScalar):
         uint64_t value
 
+    cdef cppclass CHalfFloatScalar" arrow::HalfFloatScalar"(CScalar):
+        npy_half value
+
     cdef cppclass CFloatScalar" arrow::FloatScalar"(CScalar):
         float value
 
     cdef cppclass CDoubleScalar" arrow::DoubleScalar"(CScalar):
         double value
 
-    cdef cppclass CStringScalar" arrow::StringScalar"(CScalar):
+    cdef cppclass CDecimal128Scalar" arrow::Decimal128Scalar"(CScalar):
+        CDecimal128 value
+
+    cdef cppclass CDate32Scalar" arrow::Date32Scalar"(CScalar):
+        int32_t value
+
+    cdef cppclass CDate64Scalar" arrow::Date64Scalar"(CScalar):
+        int64_t value
+
+    cdef cppclass CTime32Scalar" arrow::Time32Scalar"(CScalar):
+        int32_t value
+
+    cdef cppclass CTime64Scalar" arrow::Time64Scalar"(CScalar):
+        int64_t value
+
+    cdef cppclass CTimestampScalar" arrow::TimestampScalar"(CScalar):
+        int64_t value
+
+    cdef cppclass CDurationScalar" arrow::DurationScalar"(CScalar):
+        int64_t value
+
+    cdef cppclass CBaseBinaryScalar" arrow::BaseBinaryScalar"(CScalar):
         shared_ptr[CBuffer] value
 
+    cdef cppclass CBaseListScalar" arrow::BaseListScalar"(CScalar):
+        shared_ptr[CArray] value
+
+    cdef cppclass CListScalar" arrow::ListScalar"(CBaseListScalar):
+        pass
+
+    cdef cppclass CMapScalar" arrow::MapScalar"(CListScalar):
+        pass
+
+    cdef cppclass CStructScalar" arrow::StructScalar"(CScalar):
+        vector[shared_ptr[CScalar]] value
+        CResult[shared_ptr[CScalar]] field(CFieldRef ref) const
+
+    cdef cppclass CDictionaryScalar" arrow::DictionaryScalar"(CScalar):
+        cppclass CDictionaryValue "arrow::DictionaryScalar::ValueType":
+            shared_ptr[CScalar] index
+            shared_ptr[CArray] dictionary
+
+        CDictionaryValue value
+        CResult[shared_ptr[CScalar]] GetEncodedValue()
+
+    cdef cppclass CUnionScalar" arrow::UnionScalar"(CScalar):
+        shared_ptr[CScalar] value
+
     shared_ptr[CScalar] MakeScalar[Value](Value value)
-    shared_ptr[CScalar] MakeStringScalar" arrow::MakeScalar"(c_string value)
 
     cdef cppclass CConcatenateTablesOptions" arrow::ConcatenateTablesOptions":
         c_bool unify_schemas
@@ -1224,11 +1317,15 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         MessageType_DICTIONARY_BATCH\
             " arrow::ipc::MessageType::DICTIONARY_BATCH"
 
-    enum MetadataVersion" arrow::ipc::MetadataVersion":
-        MessageType_V1" arrow::ipc::MetadataVersion::V1"
-        MessageType_V2" arrow::ipc::MetadataVersion::V2"
-        MessageType_V3" arrow::ipc::MetadataVersion::V3"
-        MessageType_V4" arrow::ipc::MetadataVersion::V4"
+    # TODO: use "cpdef enum class" to automatically get a Python wrapper?
+    # See
+    # https://github.com/cython/cython/commit/2c7c22f51405299a4e247f78edf52957d30cf71d#diff-61c1365c0f761a8137754bb3a73bfbf7
+    ctypedef enum CMetadataVersion" arrow::ipc::MetadataVersion":
+        CMetadataVersion_V1" arrow::ipc::MetadataVersion::V1"
+        CMetadataVersion_V2" arrow::ipc::MetadataVersion::V2"
+        CMetadataVersion_V3" arrow::ipc::MetadataVersion::V3"
+        CMetadataVersion_V4" arrow::ipc::MetadataVersion::V4"
+        CMetadataVersion_V5" arrow::ipc::MetadataVersion::V5"
 
     cdef cppclass CIpcWriteOptions" arrow::ipc::IpcWriteOptions":
         c_bool allow_64bit
@@ -1236,6 +1333,9 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         int32_t alignment
         c_bool write_legacy_ipc_format
         CMemoryPool* memory_pool
+        CMetadataVersion metadata_version
+        CCompressionType compression
+        c_bool use_threads
 
         @staticmethod
         CIpcWriteOptions Defaults()
@@ -1266,7 +1366,7 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         c_bool Equals(const CMessage& other)
 
         shared_ptr[CBuffer] metadata()
-        MetadataVersion metadata_version()
+        CMetadataVersion metadata_version()
         MessageType type()
 
         CStatus SerializeTo(COutputStream* stream,
@@ -1297,12 +1397,12 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
             unique_ptr[CMessageReader] message_reader,
             const CIpcReadOptions& options)
 
-    CResult[shared_ptr[CRecordBatchWriter]] NewStreamWriter(
-        COutputStream* sink, const shared_ptr[CSchema]& schema,
+    CResult[shared_ptr[CRecordBatchWriter]] MakeStreamWriter(
+        shared_ptr[COutputStream] sink, const shared_ptr[CSchema]& schema,
         CIpcWriteOptions& options)
 
-    CResult[shared_ptr[CRecordBatchWriter]] NewFileWriter(
-        COutputStream* sink, const shared_ptr[CSchema]& schema,
+    CResult[shared_ptr[CRecordBatchWriter]] MakeFileWriter(
+        shared_ptr[COutputStream] sink, const shared_ptr[CSchema]& schema,
         CIpcWriteOptions& options)
 
     cdef cppclass CRecordBatchFileReader \
@@ -1341,8 +1441,7 @@ cdef extern from "arrow/ipc/api.h" namespace "arrow::ipc" nogil:
         const CIpcReadOptions& options)
 
     CResult[shared_ptr[CBuffer]] SerializeSchema(
-        const CSchema& schema, CDictionaryMemo* dictionary_memo,
-        CMemoryPool* pool)
+        const CSchema& schema, CMemoryPool* pool)
 
     CResult[shared_ptr[CBuffer]] SerializeRecordBatch(
         const CRecordBatch& schema, const CIpcWriteOptions& options)
@@ -1463,6 +1562,15 @@ cdef extern from "arrow/csv/api.h" namespace "arrow::csv" nogil:
 
 cdef extern from "arrow/json/options.h" nogil:
 
+    ctypedef enum CUnexpectedFieldBehavior \
+            "arrow::json::UnexpectedFieldBehavior":
+        CUnexpectedFieldBehavior_Ignore \
+            "arrow::json::UnexpectedFieldBehavior::Ignore"
+        CUnexpectedFieldBehavior_Error \
+            "arrow::json::UnexpectedFieldBehavior::Error"
+        CUnexpectedFieldBehavior_InferType \
+            "arrow::json::UnexpectedFieldBehavior::InferType"
+
     cdef cppclass CJSONReadOptions" arrow::json::ReadOptions":
         c_bool use_threads
         int32_t block_size
@@ -1473,6 +1581,7 @@ cdef extern from "arrow/json/options.h" nogil:
     cdef cppclass CJSONParseOptions" arrow::json::ParseOptions":
         shared_ptr[CSchema] explicit_schema
         c_bool newlines_in_values
+        CUnexpectedFieldBehavior unexpected_field_behavior
 
         @staticmethod
         CJSONParseOptions Defaults()
@@ -1482,14 +1591,11 @@ cdef extern from "arrow/json/reader.h" namespace "arrow::json" nogil:
 
     cdef cppclass CJSONReader" arrow::json::TableReader":
         @staticmethod
-        CStatus Make(CMemoryPool*, shared_ptr[CInputStream],
-                     CJSONReadOptions, CJSONParseOptions,
-                     shared_ptr[CJSONReader]* out)
+        CResult[shared_ptr[CJSONReader]] Make(
+            CMemoryPool*, shared_ptr[CInputStream],
+            CJSONReadOptions, CJSONParseOptions)
 
-        CStatus Read(shared_ptr[CTable]* out)
-
-    cdef CStatus ParseOne(CJSONParseOptions options, shared_ptr[CBuffer] json,
-                          shared_ptr[CRecordBatch]* out)
+        CResult[shared_ptr[CTable]] Read()
 
 
 cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
@@ -1562,6 +1668,11 @@ cdef extern from "arrow/compute/api.h" namespace "arrow::compute" nogil:
         int num_functions() const
 
     CFunctionRegistry* GetFunctionRegistry()
+
+    cdef cppclass CMatchSubstringOptions \
+            "arrow::compute::MatchSubstringOptions"(CFunctionOptions):
+        CMatchSubstringOptions(c_string pattern)
+        c_string pattern
 
     cdef cppclass CCastOptions" arrow::compute::CastOptions"(CFunctionOptions):
         CCastOptions()
@@ -1641,6 +1752,7 @@ cdef extern from "arrow/python/api.h" namespace "arrow::py" nogil:
         int64_t size
         CMemoryPool* pool
         c_bool from_pandas
+        c_bool ignore_timezone
 
     # TODO Some functions below are not actually "nogil"
 
@@ -1763,6 +1875,7 @@ cdef extern from "arrow/python/api.h" namespace "arrow::py" nogil:
         c_bool timestamp_as_object
         c_bool use_threads
         c_bool coerce_temporal_nanoseconds
+        c_bool ignore_timezone
         c_bool deduplicate_objects
         c_bool safe_cast
         c_bool split_blocks
@@ -1815,22 +1928,21 @@ cdef extern from "arrow/python/api.h" namespace "arrow::py::internal" nogil:
     CTimePoint TimePoint_from_s(double val)
     CTimePoint TimePoint_from_ns(int64_t val)
 
+    CResult[c_string] TzinfoToString(PyObject* pytzinfo)
+    CResult[PyObject*] StringToTzinfo(c_string)
+
 
 cdef extern from 'arrow/python/init.h':
     int arrow_init_numpy() except -1
-
-
-cdef extern from 'arrow/python/common.h' namespace "arrow::py":
-    c_bool IsPyError(const CStatus& status)
-    void RestorePyError(const CStatus& status)
 
 
 cdef extern from 'arrow/python/pyarrow.h' namespace 'arrow::py':
     int import_pyarrow() except -1
 
 
-cdef extern from 'arrow/python/config.h' namespace 'arrow::py':
-    void set_numpy_nan(object o)
+cdef extern from 'arrow/python/common.h' namespace "arrow::py":
+    c_bool IsPyError(const CStatus& status)
+    void RestorePyError(const CStatus& status)
 
 
 cdef extern from 'arrow/python/inference.h' namespace 'arrow::py':
@@ -1920,6 +2032,7 @@ cdef extern from 'arrow/util/iterator.h' namespace 'arrow' nogil:
             bint operator!=(RangeIterator) const
         RangeIterator begin()
         RangeIterator end()
+    CIterator[T] MakeVectorIterator[T](vector[T] v)
 
 cdef extern from 'arrow/util/thread_pool.h' namespace 'arrow' nogil:
     int GetCpuThreadPoolCapacity()

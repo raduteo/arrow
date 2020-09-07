@@ -228,6 +228,13 @@ class PrepareTest < Test::Unit::TestCase
                      ],
                    },
                    {
+                     path: "ruby/red-arrow-dataset/lib/arrow-dataset/version.rb",
+                     hunks: [
+                       ["-  VERSION = \"#{@snapshot_version}\"",
+                        "+  VERSION = \"#{@release_version}\""],
+                     ],
+                   },
+                   {
                      path: "ruby/red-arrow/lib/arrow/version.rb",
                      hunks: [
                        ["-  VERSION = \"#{@snapshot_version}\"",
@@ -260,6 +267,8 @@ class PrepareTest < Test::Unit::TestCase
                      hunks: [
                        ["-version = \"#{@snapshot_version}\"",
                         "+version = \"#{@release_version}\""],
+                       ["-arrow = { path = \"../arrow\", version = \"#{@snapshot_version}\" }",
+                        "+arrow = { path = \"../arrow\", version = \"#{@release_version}\" }"],
                      ],
                    },
                    {
@@ -281,10 +290,10 @@ class PrepareTest < Test::Unit::TestCase
                      hunks: [
                        ["-version = \"#{@snapshot_version}\"",
                         "+version = \"#{@release_version}\""],
-                       ["-arrow = { path = \"../arrow\", version = \"#{@snapshot_version}\" }",
-                        "-parquet = { path = \"../parquet\", version = \"#{@snapshot_version}\" }",
-                        "+arrow = { path = \"../arrow\", version = \"#{@release_version}\" }",
-                        "+parquet = { path = \"../parquet\", version = \"#{@release_version}\" }"],
+                       ["-arrow = { path = \"../arrow\", version = \"#{@snapshot_version}\", features = [\"prettyprint\"] }",
+                        "-parquet = { path = \"../parquet\", version = \"#{@snapshot_version}\", features = [\"arrow\"] }",
+                        "+arrow = { path = \"../arrow\", version = \"#{@release_version}\", features = [\"prettyprint\"] }",
+                        "+parquet = { path = \"../parquet\", version = \"#{@release_version}\", features = [\"arrow\"] }"],
                        ["-arrow-flight = { path = \"../arrow-flight\", version = \"#{@snapshot_version}\" }",
                         "+arrow-flight = { path = \"../arrow-flight\", version = \"#{@release_version}\" }"]
                      ],
@@ -426,6 +435,13 @@ class PrepareTest < Test::Unit::TestCase
                      ],
                    },
                    {
+                     path: "ruby/red-arrow-dataset/lib/arrow-dataset/version.rb",
+                     hunks: [
+                       ["-  VERSION = \"#{@release_version}\"",
+                        "+  VERSION = \"#{@next_snapshot_version}\""],
+                     ],
+                   },
+                   {
                      path: "ruby/red-arrow/lib/arrow/version.rb",
                      hunks: [
                        ["-  VERSION = \"#{@release_version}\"",
@@ -458,6 +474,8 @@ class PrepareTest < Test::Unit::TestCase
                      hunks: [
                        ["-version = \"#{@release_version}\"",
                         "+version = \"#{@next_snapshot_version}\""],
+                       ["-arrow = { path = \"../arrow\", version = \"#{@release_version}\" }",
+                        "+arrow = { path = \"../arrow\", version = \"#{@next_snapshot_version}\" }"],
                      ],
                    },
                    {
@@ -479,10 +497,10 @@ class PrepareTest < Test::Unit::TestCase
                      hunks: [
                        ["-version = \"#{@release_version}\"",
                         "+version = \"#{@next_snapshot_version}\""],
-                       ["-arrow = { path = \"../arrow\", version = \"#{@release_version}\" }",
-                        "-parquet = { path = \"../parquet\", version = \"#{@release_version}\" }",
-                        "+arrow = { path = \"../arrow\", version = \"#{@next_snapshot_version}\" }",
-                        "+parquet = { path = \"../parquet\", version = \"#{@next_snapshot_version}\" }"],
+                       ["-arrow = { path = \"../arrow\", version = \"#{@release_version}\", features = [\"prettyprint\"] }",
+                        "-parquet = { path = \"../parquet\", version = \"#{@release_version}\", features = [\"arrow\"] }",
+                        "+arrow = { path = \"../arrow\", version = \"#{@next_snapshot_version}\", features = [\"prettyprint\"] }",
+                        "+parquet = { path = \"../parquet\", version = \"#{@next_snapshot_version}\", features = [\"arrow\"] }"],
                        ["-arrow-flight = { path = \"../arrow-flight\", version = \"#{@release_version}\" }",
                         "+arrow-flight = { path = \"../arrow-flight\", version = \"#{@next_snapshot_version}\" }"]
                      ],

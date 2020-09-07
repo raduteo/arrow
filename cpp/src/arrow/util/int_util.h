@@ -18,8 +18,6 @@
 #pragma once
 
 #include <cstdint>
-#include <limits>
-#include <type_traits>
 
 #include "arrow/status.h"
 #include "arrow/util/visibility.h"
@@ -74,56 +72,6 @@ void DowncastUInts(const uint64_t* source, uint64_t* dest, int64_t length);
 template <typename InputInt, typename OutputInt>
 ARROW_EXPORT void TransposeInts(const InputInt* source, OutputInt* dest, int64_t length,
                                 const int32_t* transpose_map);
-
-/// Signed addition with well-defined behaviour on overflow (as unsigned)
-template <typename SignedInt>
-SignedInt SafeSignedAdd(SignedInt u, SignedInt v) {
-  using UnsignedInt = typename std::make_unsigned<SignedInt>::type;
-  return static_cast<SignedInt>(static_cast<UnsignedInt>(u) +
-                                static_cast<UnsignedInt>(v));
-}
-
-/// Signed left shift with well-defined behaviour on negative numbers or overflow
-template <typename SignedInt, typename Shift>
-SignedInt SafeLeftShift(SignedInt u, Shift shift) {
-  using UnsignedInt = typename std::make_unsigned<SignedInt>::type;
-  return static_cast<SignedInt>(static_cast<UnsignedInt>(u) << shift);
-}
-
-/// Detect multiplication overflow between *positive* integers
-template <typename Integer>
-bool HasMultiplyOverflow(Integer value, Integer multiplicand) {
-  return (multiplicand != 0 &&
-          value > std::numeric_limits<Integer>::max() / multiplicand);
-}
-
-/// Detect addition overflow between *positive* integers
-template <typename Integer>
-bool HasAdditionOverflow(Integer value, Integer addend) {
-  return (value > std::numeric_limits<Integer>::max() - addend);
-}
-
-/// Detect addition overflow between integers
-template <typename Integer>
-bool HasSubtractionOverflow(Integer value, Integer minuend) {
-  return (value < minuend);
-}
-
-/// Upcast an integer to the largest possible width (currently 64 bits)
-
-template <typename Integer>
-typename std::enable_if<
-    std::is_integral<Integer>::value && std::is_signed<Integer>::value, int64_t>::type
-UpcastInt(Integer v) {
-  return v;
-}
-
-template <typename Integer>
-typename std::enable_if<
-    std::is_integral<Integer>::value && std::is_unsigned<Integer>::value, uint64_t>::type
-UpcastInt(Integer v) {
-  return v;
-}
 
 /// \brief Do vectorized boundschecking of integer-type array indices. The
 /// indices must be non-nonnegative and strictly less than the passed upper

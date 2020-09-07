@@ -44,6 +44,17 @@ class FunctionRegistry::FunctionRegistryImpl {
     return Status::OK();
   }
 
+  Status AddAlias(const std::string& target_name, const std::string& source_name) {
+    std::lock_guard<std::mutex> mutation_guard(lock_);
+
+    auto it = name_to_function_.find(source_name);
+    if (it == name_to_function_.end()) {
+      return Status::KeyError("No function registered with name: ", source_name);
+    }
+    name_to_function_[target_name] = it->second;
+    return Status::OK();
+  }
+
   Result<std::shared_ptr<Function>> GetFunction(const std::string& name) const {
     auto it = name_to_function_.find(name);
     if (it == name_to_function_.end()) {
@@ -81,6 +92,11 @@ Status FunctionRegistry::AddFunction(std::shared_ptr<Function> function,
   return impl_->AddFunction(std::move(function), allow_overwrite);
 }
 
+Status FunctionRegistry::AddAlias(const std::string& target_name,
+                                  const std::string& source_name) {
+  return impl_->AddAlias(target_name, source_name);
+}
+
 Result<std::shared_ptr<Function>> FunctionRegistry::GetFunction(
     const std::string& name) const {
   return impl_->GetFunction(name);
@@ -102,9 +118,11 @@ static std::unique_ptr<FunctionRegistry> CreateBuiltInRegistry() {
   RegisterScalarBoolean(registry.get());
   RegisterScalarCast(registry.get());
   RegisterScalarComparison(registry.get());
+  RegisterScalarNested(registry.get());
   RegisterScalarSetLookup(registry.get());
   RegisterScalarStringAscii(registry.get());
   RegisterScalarValidity(registry.get());
+  RegisterScalarFillNull(registry.get());
 
   // Aggregate functions
   RegisterScalarAggregateBasic(registry.get());
@@ -112,6 +130,7 @@ static std::unique_ptr<FunctionRegistry> CreateBuiltInRegistry() {
   // Vector functions
   RegisterVectorHash(registry.get());
   RegisterVectorSelection(registry.get());
+  RegisterVectorNested(registry.get());
   RegisterVectorSort(registry.get());
 
   return registry;

@@ -65,11 +65,15 @@ cmake -G "%GENERATOR%" ^
       -DARROW_DATASET=ON ^
       -DARROW_FLIGHT=ON ^
       -DARROW_GANDIVA=OFF ^
+      -DARROW_LZ4_USE_SHARED=OFF ^
       -DARROW_MIMALLOC=ON ^
       -DARROW_PARQUET=ON ^
       -DARROW_PYTHON=ON ^
+      -DARROW_SNAPPY_USE_SHARED=OFF ^
       -DARROW_VERBOSE_THIRDPARTY_BUILD=ON ^
-      -DZSTD_SOURCE=BUNDLED ^
+      -DBrotli_SOURCE=BUNDLED ^
+      -Dzstd_SOURCE=BUNDLED ^
+      -Dutf8proc_SOURCE=BUNDLED ^
       .. || exit /B
 cmake --build . --target install --config Release || exit /B
 popd

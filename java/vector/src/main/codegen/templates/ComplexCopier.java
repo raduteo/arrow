@@ -20,6 +20,7 @@ import org.apache.arrow.vector.complex.impl.UnionMapReader;
 import org.apache.arrow.vector.complex.impl.UnionMapWriter;
 import org.apache.arrow.vector.complex.reader.FieldReader;
 import org.apache.arrow.vector.complex.writer.FieldWriter;
+import org.apache.arrow.vector.types.Types;
 
 <@pp.dropOutputFile />
 <@pp.changeOutputFile name="/org/apache/arrow/vector/complex/impl/ComplexCopier.java" />
@@ -52,6 +53,7 @@ public class ComplexCopier {
       switch (mt) {
 
       case LIST:
+      case LARGELIST:
       case FIXED_SIZE_LIST:
         if (reader.isSet()) {
           writer.startList();
@@ -97,11 +99,13 @@ public class ComplexCopier {
           writer.start();
           for(String name : reader){
             FieldReader childReader = reader.reader(name);
-            FieldWriter childWriter = getStructWriterForReader(childReader, writer, name);
-            if(childReader.isSet()){
-              writeValue(childReader, childWriter);
-            } else {
-              childWriter.writeNull();
+            if (childReader.getMinorType() != Types.MinorType.NULL) {
+              FieldWriter childWriter = getStructWriterForReader(childReader, writer, name);
+              if (childReader.isSet()) {
+                writeValue(childReader, childWriter);
+              } else {
+                childWriter.writeNull();
+              }
             }
           }
           writer.end();

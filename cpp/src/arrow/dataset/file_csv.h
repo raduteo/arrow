@@ -19,14 +19,12 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 #include "arrow/csv/options.h"
 #include "arrow/dataset/file_base.h"
 #include "arrow/dataset/type_fwd.h"
 #include "arrow/dataset/visibility.h"
-#include "arrow/result.h"
+#include "arrow/status.h"
 
 namespace arrow {
 namespace dataset {
@@ -45,9 +43,13 @@ class ARROW_DS_EXPORT CsvFileFormat : public FileFormat {
   Result<std::shared_ptr<Schema>> Inspect(const FileSource& source) const override;
 
   /// \brief Open a file for scanning
-  Result<ScanTaskIterator> ScanFile(const FileSource& source,
-                                    std::shared_ptr<ScanOptions> options,
-                                    std::shared_ptr<ScanContext> context) const override;
+  Result<ScanTaskIterator> ScanFile(std::shared_ptr<ScanOptions> options,
+                                    std::shared_ptr<ScanContext> context,
+                                    FileFragment* fragment) const override;
+
+  Status WriteFragment(RecordBatchReader*, io::OutputStream*) const override {
+    return Status::NotImplemented("writing fragment of CsvFileFormat");
+  }
 };
 
 }  // namespace dataset

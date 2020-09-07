@@ -3,7 +3,6 @@
 [![cran](https://www.r-pkg.org/badges/version-last-release/arrow)](https://cran.r-project.org/package=arrow)
 [![CI](https://github.com/apache/arrow/workflows/R/badge.svg?event=push)](https://github.com/apache/arrow/actions?query=workflow%3AR+branch%3Amaster+event%3Apush)
 [![conda-forge](https://img.shields.io/conda/vn/conda-forge/r-arrow.svg)](https://anaconda.org/conda-forge/r-arrow)
-[![codecov](https://codecov.io/gh/ursa-labs/arrow-r-nightly/branch/master/graph/badge.svg)](https://codecov.io/gh/ursa-labs/arrow-r-nightly)
 
 [Apache Arrow](https://arrow.apache.org/) is a cross-language
 development platform for in-memory data. It specifies a standardized
@@ -92,7 +91,7 @@ brew install apache-arrow --HEAD
 ```
 
 On Windows, you can download a .zip file with the arrow dependencies from the
-[nightly bintray repository](https://dl.bintray.com/ursalabs/arrow-r/libarrow/bin/windows-35/),
+[nightly bintray repository](https://dl.bintray.com/ursalabs/arrow-r/libarrow/bin/windows/),
 and then set the `RWINLIB_LOCAL` environment variable to point to that
 zip file before installing the `arrow` R package. Version numbers in that
 repository correspond to dates, and you will likely want the most recent.
@@ -108,7 +107,7 @@ Note that after any change to the C++ library, you must reinstall it and
 run `make clean` or `git clean -fdx .` to remove any cached object code
 in the `r/src/` directory before reinstalling the R package. This is
 only necessary if you make changes to the C++ library source; you do not
-need to manually purge object files if you are only editing R or Rcpp
+need to manually purge object files if you are only editing R or C++
 code inside `r/`.
 
 Once you’ve built the C++ library, you can install the R package and its
@@ -121,7 +120,7 @@ R -e 'install.packages(c("devtools", "roxygen2", "pkgdown", "covr")); devtools::
 R CMD INSTALL .
 ```
 
-If you need to set any compilation flags while building the Rcpp
+If you need to set any compilation flags while building the C++
 extensions, you can use the `ARROW_R_CXXFLAGS` environment variable. For
 example, if you are using `perf` to profile the R extensions, you may
 need to set
@@ -150,21 +149,14 @@ For any other build/configuration challenges, see the [C++ developer
 guide](https://arrow.apache.org/docs/developers/cpp/building.html) and
 `vignette("install", package = "arrow")`.
 
-### Editing Rcpp code
+### Editing C++ code
 
-The `arrow` package uses some customized tools on top of `Rcpp` to
+The `arrow` package uses some customized tools on top of `cpp11` to
 prepare its C++ code in `src/`. If you change C++ code in the R package,
 you will need to set the `ARROW_R_DEV` environment variable to `TRUE`
 (optionally, add it to your`~/.Renviron` file to persist across
 sessions) so that the `data-raw/codegen.R` file is used for code
 generation.
-
-The codegen.R script has these additional dependencies:
-
-``` r
-remotes::install_github("nealrichardson/decor")
-install.packages("glue")
-```
 
 We use Google C++ style in our C++ code. Check for style errors with
 

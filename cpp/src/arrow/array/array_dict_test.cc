@@ -814,19 +814,17 @@ TEST(TestFixedSizeBinaryDictionaryBuilder, DoubleTableSize) {
   ASSERT_TRUE(expected.Equals(result));
 }
 
-TEST(TestFixedSizeBinaryDictionaryBuilder, InvalidTypeAppend) {
+#ifndef NDEBUG
+TEST(TestFixedSizeBinaryDictionaryBuilder, AppendArrayInvalidType) {
   // Build the dictionary Array
-  auto value_type = arrow::fixed_size_binary(4);
+  auto value_type = fixed_size_binary(4);
   DictionaryBuilder<FixedSizeBinaryType> builder(value_type);
   // Build an array with different byte width
-  FixedSizeBinaryBuilder fsb_builder(arrow::fixed_size_binary(5));
-  std::vector<uint8_t> value{100, 1, 1, 1, 1};
-  ASSERT_OK(fsb_builder.Append(value.data()));
-  std::shared_ptr<Array> fsb_array;
-  ASSERT_OK(fsb_builder.Finish(&fsb_array));
+  auto fsb_array = ArrayFromJSON(fixed_size_binary(3), R"(["foo", "bar"])");
 
-  ASSERT_RAISES(Invalid, builder.AppendArray(*fsb_array));
+  ASSERT_RAISES(TypeError, builder.AppendArray(*fsb_array));
 }
+#endif
 
 TEST(TestDecimalDictionaryBuilder, Basic) {
   // Build the dictionary Array
@@ -902,6 +900,78 @@ TEST(TestDecimalDictionaryBuilder, DoubleTableSize) {
 
   DictionaryArray expected(dictionary(int16(), decimal_type), int_array, decimal_array);
   ASSERT_TRUE(expected.Equals(result));
+}
+
+TEST(TestNullDictionaryBuilder, Basic) {
+  // MakeBuilder
+  auto dict_type = dictionary(int8(), null());
+  std::unique_ptr<ArrayBuilder> boxed_builder;
+  ASSERT_OK(MakeBuilder(default_memory_pool(), dict_type, &boxed_builder));
+  auto& builder = checked_cast<DictionaryBuilder<NullType>&>(*boxed_builder);
+
+  ASSERT_OK(builder.AppendNull());
+  ASSERT_OK(builder.AppendNull());
+  ASSERT_OK(builder.AppendNull());
+  ASSERT_EQ(3, builder.length());
+  ASSERT_EQ(3, builder.null_count());
+
+  ASSERT_OK(builder.AppendNulls(4));
+  ASSERT_EQ(7, builder.length());
+  ASSERT_EQ(7, builder.null_count());
+
+  auto null_array = ArrayFromJSON(null(), "[null, null, null, null]");
+  ASSERT_OK(builder.AppendArray(*null_array));
+  ASSERT_EQ(11, builder.length());
+  ASSERT_EQ(11, builder.null_count());
+
+  std::shared_ptr<Array> result;
+  ASSERT_OK(builder.Finish(&result));
+  AssertTypeEqual(*dict_type, *result->type());
+  ASSERT_EQ(11, result->length());
+  ASSERT_EQ(11, result->null_count());
+}
+
+#ifndef NDEBUG
+TEST(TestNullDictionaryBuilder, AppendArrayInvalidType) {
+  // MakeBuilder
+  auto dict_type = dictionary(int8(), null());
+  std::unique_ptr<ArrayBuilder> boxed_builder;
+  ASSERT_OK(MakeBuilder(default_memory_pool(), dict_type, &boxed_builder));
+  auto& builder = checked_cast<DictionaryBuilder<NullType>&>(*boxed_builder);
+
+  auto int8_array = ArrayFromJSON(int8(), "[0, 1, 0, null]");
+  ASSERT_RAISES(TypeError, builder.AppendArray(*int8_array));
+}
+#endif
+
+// ----------------------------------------------------------------------
+// Index byte width tests
+
+template <typename IndexType, typename ValueType>
+void AssertIndexByteWidth(const std::shared_ptr<DataType>& value_type =
+                              TypeTraits<ValueType>::type_singleton()) {
+  auto index_type = TypeTraits<IndexType>::type_singleton();
+  auto dict_type =
+      checked_pointer_cast<DictionaryType>(dictionary(index_type, value_type));
+  std::unique_ptr<ArrayBuilder> builder;
+  ASSERT_OK(MakeBuilder(default_memory_pool(), dict_type, &builder));
+  auto builder_dict_type = checked_pointer_cast<DictionaryType>(builder->type());
+  AssertTypeEqual(dict_type->index_type(), builder_dict_type->index_type());
+}
+
+typedef ::testing::Types<Int8Type, Int16Type, Int32Type, Int64Type> IndexTypes;
+
+template <typename Type>
+class TestDictionaryBuilderIndexByteWidth : public TestBuilder {};
+
+TYPED_TEST_SUITE(TestDictionaryBuilderIndexByteWidth, IndexTypes);
+
+TYPED_TEST(TestDictionaryBuilderIndexByteWidth, MakeBuilder) {
+  AssertIndexByteWidth<TypeParam, FloatType>();
+  AssertIndexByteWidth<TypeParam, BinaryType>();
+  AssertIndexByteWidth<TypeParam, StringType>();
+  AssertIndexByteWidth<TypeParam, FixedSizeBinaryType>(fixed_size_binary(4));
+  AssertIndexByteWidth<TypeParam, NullType>();
 }
 
 // ----------------------------------------------------------------------
@@ -1001,26 +1071,38 @@ TEST(TestDictionary, Validate) {
       "");
 }
 
-TEST(TestDictionary, FromArray) {
+TEST(TestDictionary, FromArrays) {
   auto dict = ArrayFromJSON(utf8(), "[\"foo\", \"bar\", \"baz\"]");
-  auto dict_type = dictionary(int16(), utf8());
+  for (auto index_ty : all_dictionary_index_types()) {
+    auto dict_type = dictionary(index_ty, utf8());
 
-  auto indices1 = ArrayFromJSON(int16(), "[1, 2, 0, 0, 2, 0]");
-  auto indices2 = ArrayFromJSON(int16(), "[1, 2, 0, 3, 2, 0]");
+    auto indices1 = ArrayFromJSON(index_ty, "[1, 2, 0, 0, 2, 0]");
+    // Index out of bounds
+    auto indices2 = ArrayFromJSON(index_ty, "[1, 2, 0, 3, 2, 0]");
 
-  // Invalid index is masked by null
-  std::shared_ptr<Array> indices3;
-  std::vector<bool> is_valid3 = {true, true, false, true, true, true};
-  std::vector<int16_t> indices_values3 = {1, 2, -1, 0, 2, 0};
-  ArrayFromVector<Int16Type, int16_t>(is_valid3, indices_values3, &indices3);
+    ASSERT_OK_AND_ASSIGN(auto arr1,
+                         DictionaryArray::FromArrays(dict_type, indices1, dict));
+    ASSERT_RAISES(IndexError, DictionaryArray::FromArrays(dict_type, indices2, dict));
 
-  // Index out of bounds
-  auto indices4 = ArrayFromJSON(int16(), "[1, 2, null, 3, 2, 0]");
+    if (checked_cast<const IntegerType&>(*index_ty).is_signed()) {
+      // Invalid index is masked by null, so it's OK
+      auto indices3 = ArrayFromJSON(index_ty, "[1, 2, -1, null, 2, 0]");
+      BitUtil::ClearBit(indices3->data()->buffers[0]->mutable_data(), 2);
+      ASSERT_OK_AND_ASSIGN(auto arr3,
+                           DictionaryArray::FromArrays(dict_type, indices3, dict));
+    }
 
-  ASSERT_OK_AND_ASSIGN(auto arr1, DictionaryArray::FromArrays(dict_type, indices1, dict));
-  ASSERT_RAISES(Invalid, DictionaryArray::FromArrays(dict_type, indices2, dict));
-  ASSERT_OK_AND_ASSIGN(auto arr3, DictionaryArray::FromArrays(dict_type, indices3, dict));
-  ASSERT_RAISES(Invalid, DictionaryArray::FromArrays(dict_type, indices4, dict));
+    auto indices4 = ArrayFromJSON(index_ty, "[1, 2, null, 3, 2, 0]");
+    ASSERT_RAISES(IndexError, DictionaryArray::FromArrays(dict_type, indices4, dict));
+
+    // Probe other validation checks
+    ASSERT_RAISES(TypeError, DictionaryArray::FromArrays(index_ty, indices4, dict));
+
+    auto different_index_ty =
+        dictionary(index_ty->id() == Type::INT8 ? uint8() : int8(), utf8());
+    ASSERT_RAISES(TypeError,
+                  DictionaryArray::FromArrays(different_index_ty, indices4, dict));
+  }
 }
 
 static void CheckTranspose(const std::shared_ptr<Array>& input,
@@ -1040,39 +1122,48 @@ static void CheckTranspose(const std::shared_ptr<Array>& input,
 
 TEST(TestDictionary, TransposeBasic) {
   auto dict = ArrayFromJSON(utf8(), "[\"A\", \"B\", \"C\"]");
-  auto dict_type = dictionary(int16(), utf8());
-  auto indices = ArrayFromJSON(int16(), "[1, 2, 0, 0]");
-  // ["B", "C", "A", "A"]
-  ASSERT_OK_AND_ASSIGN(auto arr, DictionaryArray::FromArrays(dict_type, indices, dict));
-  // ["C", "A"]
-  auto sliced = arr->Slice(1, 2);
 
-  // Transpose to same index type
-  {
-    auto out_dict_type = dict_type;
+  auto CheckIndexType = [&](const std::shared_ptr<DataType>& index_ty) {
+    auto dict_type = dictionary(index_ty, utf8());
+    auto indices = ArrayFromJSON(index_ty, "[1, 2, 0, 0]");
+    // ["B", "C", "A", "A"]
+    ASSERT_OK_AND_ASSIGN(auto arr, DictionaryArray::FromArrays(dict_type, indices, dict));
+    // ["C", "A"]
+    auto sliced = arr->Slice(1, 2);
+
+    // Transpose to same index type
+    {
+      auto out_dict_type = dict_type;
+      auto out_dict = ArrayFromJSON(utf8(), "[\"Z\", \"A\", \"C\", \"B\"]");
+      auto expected_indices = ArrayFromJSON(index_ty, "[3, 2, 1, 1]");
+      std::vector<int32_t> transpose_map = {1, 3, 2};
+      CheckTranspose(arr, transpose_map.data(), out_dict_type, out_dict,
+                     expected_indices);
+
+      // Sliced
+      expected_indices = ArrayFromJSON(index_ty, "[2, 1]");
+      CheckTranspose(sliced, transpose_map.data(), out_dict_type, out_dict,
+                     expected_indices);
+    }
+
+    // Transpose to other index type
     auto out_dict = ArrayFromJSON(utf8(), "[\"Z\", \"A\", \"C\", \"B\"]");
-    auto expected_indices = ArrayFromJSON(int16(), "[3, 2, 1, 1]");
     std::vector<int32_t> transpose_map = {1, 3, 2};
-    CheckTranspose(arr, transpose_map.data(), out_dict_type, out_dict, expected_indices);
+    for (auto other_ty : all_dictionary_index_types()) {
+      auto out_dict_type = dictionary(other_ty, utf8());
+      auto expected_indices = ArrayFromJSON(other_ty, "[3, 2, 1, 1]");
+      CheckTranspose(arr, transpose_map.data(), out_dict_type, out_dict,
+                     expected_indices);
 
-    // Sliced
-    expected_indices = ArrayFromJSON(int16(), "[2, 1]");
-    CheckTranspose(sliced, transpose_map.data(), out_dict_type, out_dict,
-                   expected_indices);
-  }
+      // Sliced
+      expected_indices = ArrayFromJSON(other_ty, "[2, 1]");
+      CheckTranspose(sliced, transpose_map.data(), out_dict_type, out_dict,
+                     expected_indices);
+    }
+  };
 
-  // Transpose to other index type
-  {
-    auto out_dict_type = dictionary(int8(), utf8());
-    auto out_dict = ArrayFromJSON(utf8(), "[\"Z\", \"A\", \"C\", \"B\"]");
-    auto expected_indices = ArrayFromJSON(int8(), "[3, 2, 1, 1]");
-    std::vector<int32_t> transpose_map = {1, 3, 2};
-    CheckTranspose(arr, transpose_map.data(), out_dict_type, out_dict, expected_indices);
-
-    // Sliced
-    expected_indices = ArrayFromJSON(int8(), "[2, 1]");
-    CheckTranspose(sliced, transpose_map.data(), out_dict_type, out_dict,
-                   expected_indices);
+  for (auto ty : all_dictionary_index_types()) {
+    CheckIndexType(ty);
   }
 }
 
@@ -1113,6 +1204,31 @@ TEST(TestDictionary, TransposeTrivial) {
     expected_indices = ArrayFromJSON(int8(), "[2, 0]");
     CheckTranspose(sliced, transpose_map.data(), out_dict_type, out_dict,
                    expected_indices);
+  }
+}
+
+TEST(TestDictionary, GetValueIndex) {
+  const char* indices_json = "[5, 0, 1, 3, 2, 4]";
+  auto indices_int64 = ArrayFromJSON(int64(), indices_json);
+  auto dict = ArrayFromJSON(int32(), "[10, 20, 30, 40, 50, 60]");
+
+  const auto& typed_indices_int64 = checked_cast<const Int64Array&>(*indices_int64);
+  for (auto index_ty : all_dictionary_index_types()) {
+    auto indices = ArrayFromJSON(index_ty, indices_json);
+    auto dict_ty = dictionary(index_ty, int32());
+
+    DictionaryArray dict_arr(dict_ty, indices, dict);
+
+    int64_t offset = 1;
+    auto sliced_dict_arr = dict_arr.Slice(offset);
+
+    for (int64_t i = 0; i < indices->length(); ++i) {
+      ASSERT_EQ(dict_arr.GetValueIndex(i), typed_indices_int64.Value(i));
+      if (i < sliced_dict_arr->length()) {
+        ASSERT_EQ(checked_cast<const DictionaryArray&>(*sliced_dict_arr).GetValueIndex(i),
+                  typed_indices_int64.Value(i + offset));
+      }
+    }
   }
 }
 

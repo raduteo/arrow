@@ -47,6 +47,7 @@ class ARROW_PYTHON_EXPORT PyFileSystemVtable {
   std::function<void(PyObject*, const std::string& path, bool)> create_dir;
   std::function<void(PyObject*, const std::string& path)> delete_dir;
   std::function<void(PyObject*, const std::string& path)> delete_dir_contents;
+  std::function<void(PyObject*)> delete_root_dir_contents;
   std::function<void(PyObject*, const std::string& path)> delete_file;
   std::function<void(PyObject*, const std::string& src, const std::string& dest)> move;
   std::function<void(PyObject*, const std::string& src, const std::string& dest)>
@@ -64,6 +65,9 @@ class ARROW_PYTHON_EXPORT PyFileSystemVtable {
   std::function<void(PyObject*, const std::string& path,
                      std::shared_ptr<io::OutputStream>* out)>
       open_append_stream;
+
+  std::function<void(PyObject*, const std::string& path, std::string* out)>
+      normalize_path;
 };
 
 class ARROW_PYTHON_EXPORT PyFileSystem : public arrow::fs::FileSystem {
@@ -87,6 +91,7 @@ class ARROW_PYTHON_EXPORT PyFileSystem : public arrow::fs::FileSystem {
 
   Status DeleteDir(const std::string& path) override;
   Status DeleteDirContents(const std::string& path) override;
+  Status DeleteRootDirContents() override;
 
   Status DeleteFile(const std::string& path) override;
 
@@ -102,6 +107,8 @@ class ARROW_PYTHON_EXPORT PyFileSystem : public arrow::fs::FileSystem {
       const std::string& path) override;
   Result<std::shared_ptr<io::OutputStream>> OpenAppendStream(
       const std::string& path) override;
+
+  Result<std::string> NormalizePath(std::string path) override;
 
   PyObject* handler() const { return handler_.obj(); }
 

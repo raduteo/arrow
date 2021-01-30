@@ -15,24 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::env;
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 extern crate arrow;
 extern crate datafusion;
 
 use arrow::{array::*, datatypes::TimeUnit};
-use arrow::{datatypes::Int32Type, record_batch::RecordBatch};
+use arrow::{datatypes::Int32Type, datatypes::Int64Type, record_batch::RecordBatch};
 use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     util::display::array_value_to_string,
 };
 
-use datafusion::datasource::{csv::CsvReadOptions, MemTable};
 use datafusion::error::Result;
 use datafusion::execution::context::ExecutionContext;
-use datafusion::logical_plan::LogicalPlan;
+use datafusion::logical_plan::{LogicalPlan, ToDFSchema};
 use datafusion::prelude::create_udf;
+use datafusion::{
+    datasource::{csv::CsvReadOptions, MemTable},
+    physical_plan::collect,
+};
 
 #[tokio::test]
 async fn nyc() -> Result<()> {
@@ -81,9 +84,9 @@ async fn nyc() -> Result<()> {
                 assert_eq!(projected_schema.field(0).name(), "passenger_count");
                 assert_eq!(projected_schema.field(1).name(), "fare_amount");
             }
-            _ => assert!(false),
+            _ => unreachable!(),
         },
-        _ => assert!(false),
+        _ => unreachable!(false),
     }
 
     Ok(())
@@ -114,18 +117,145 @@ async fn parquet_query() {
 #[tokio::test]
 async fn parquet_single_nan_schema() {
     let mut ctx = ExecutionContext::new();
-    let testdata = env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::parquet_test_data();
     ctx.register_parquet("single_nan", &format!("{}/single_nan.parquet", testdata))
         .unwrap();
     let sql = "SELECT mycol FROM single_nan";
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
     let plan = ctx.create_physical_plan(&plan).unwrap();
-    let results = ctx.collect(plan).await.unwrap();
+    let results = collect(plan).await.unwrap();
     for batch in results {
         assert_eq!(1, batch.num_rows());
         assert_eq!(1, batch.num_columns());
     }
+}
+
+#[tokio::test]
+#[ignore = "Test ignored, will be enabled as part of the nested Parquet reader"]
+async fn parquet_list_columns() {
+    let mut ctx = ExecutionContext::new();
+    let testdata = arrow::util::test_util::parquet_test_data();
+    ctx.register_parquet(
+        "list_columns",
+        &format!("{}/list_columns.parquet", testdata),
+    )
+    .unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "int64_list",
+            DataType::List(Box::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+        Field::new(
+            "utf8_list",
+            DataType::List(Box::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+
+    let sql = "SELECT int64_list, utf8_list FROM list_columns";
+    let plan = ctx.create_logical_plan(&sql).unwrap();
+    let plan = ctx.optimize(&plan).unwrap();
+    let plan = ctx.create_physical_plan(&plan).unwrap();
+    let results = collect(plan).await.unwrap();
+
+    //   int64_list              utf8_list
+    // 0  [1, 2, 3]        [abc, efg, hij]
+    // 1  [None, 1]                   None
+    // 2        [4]  [efg, None, hij, xyz]
+
+    assert_eq!(1, results.len());
+    let batch = &results[0];
+    assert_eq!(3, batch.num_rows());
+    assert_eq!(2, batch.num_columns());
+    assert_eq!(schema, batch.schema());
+
+    let int_list_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let utf8_list_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+
+    assert_eq!(
+        int_list_array
+            .value(0)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap(),
+        &PrimitiveArray::<Int64Type>::from(vec![Some(1), Some(2), Some(3),])
+    );
+
+    assert_eq!(
+        utf8_list_array
+            .value(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap(),
+        &StringArray::try_from(vec![Some("abc"), Some("efg"), Some("hij"),]).unwrap()
+    );
+
+    assert_eq!(
+        int_list_array
+            .value(1)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap(),
+        &PrimitiveArray::<Int64Type>::from(vec![None, Some(1),])
+    );
+
+    assert!(utf8_list_array.is_null(1));
+
+    assert_eq!(
+        int_list_array
+            .value(2)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Int64Type>>()
+            .unwrap(),
+        &PrimitiveArray::<Int64Type>::from(vec![Some(4),])
+    );
+
+    let result = utf8_list_array.value(2);
+    let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(result.value(0), "efg");
+    assert!(result.is_null(1));
+    assert_eq!(result.value(2), "hij");
+    assert_eq!(result.value(3), "xyz");
+}
+
+#[tokio::test]
+async fn csv_select_nested() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT o1, o2, c3
+               FROM (
+                 SELECT c1 AS o1, c2 + 1 AS o2, c3
+                 FROM (
+                   SELECT c1, c2, c3, c4
+                   FROM aggregate_test_100
+                   WHERE c1 = 'a' AND c2 >= 4
+                   ORDER BY c2 ASC, c3 ASC
+                 )
+               )";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["a", "5", "-101"],
+        vec!["a", "5", "-54"],
+        vec!["a", "5", "-38"],
+        vec!["a", "5", "65"],
+        vec!["a", "6", "-101"],
+        vec!["a", "6", "-31"],
+        vec!["a", "6", "36"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
 }
 
 #[tokio::test]
@@ -149,6 +279,17 @@ async fn csv_query_with_predicate() -> Result<()> {
         vec!["e", "0.39144436569161134"],
         vec!["d", "0.38870280983958583"],
     ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_query_with_negative_predicate() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c1, c4 FROM aggregate_test_100 WHERE c3 < -55 AND -c4 > 30000";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["e", "-31500"], vec!["c", "-30187"]];
     assert_eq!(expected, actual);
     Ok(())
 }
@@ -205,6 +346,63 @@ async fn csv_query_group_by_int_min_max() -> Result<()> {
 }
 
 #[tokio::test]
+async fn csv_query_group_by_float32() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_simple_csv(&mut ctx)?;
+
+    let sql =
+        "SELECT COUNT(*) as cnt, c1 FROM aggregate_simple GROUP BY c1 ORDER BY cnt DESC";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![
+        vec!["5", "0.00005"],
+        vec!["4", "0.00004"],
+        vec!["3", "0.00003"],
+        vec!["2", "0.00002"],
+        vec!["1", "0.00001"],
+    ];
+    assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_query_group_by_float64() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_simple_csv(&mut ctx)?;
+
+    let sql =
+        "SELECT COUNT(*) as cnt, c2 FROM aggregate_simple GROUP BY c2 ORDER BY cnt DESC";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![
+        vec!["5", "0.000000000005"],
+        vec!["4", "0.000000000004"],
+        vec!["3", "0.000000000003"],
+        vec!["2", "0.000000000002"],
+        vec!["1", "0.000000000001"],
+    ];
+    assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_query_group_by_boolean() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_simple_csv(&mut ctx)?;
+
+    let sql =
+        "SELECT COUNT(*) as cnt, c3 FROM aggregate_simple GROUP BY c3 ORDER BY cnt DESC";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![vec!["9", "true"], vec!["6", "false"]];
+    assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn csv_query_group_by_two_columns() -> Result<()> {
     let mut ctx = ExecutionContext::new();
     register_aggregate_csv(&mut ctx)?;
@@ -250,7 +448,7 @@ async fn csv_query_avg_sqrt() -> Result<()> {
     let mut actual = execute(&mut ctx, sql).await;
     actual.sort();
     let expected = vec![vec!["0.6706002946036462"]];
-    assert_eq!(actual, expected);
+    assert_float_eq(&expected, &actual);
     Ok(())
 }
 
@@ -264,7 +462,7 @@ async fn csv_query_custom_udf_with_cast() -> Result<()> {
     let sql = "SELECT avg(custom_sqrt(c11)) FROM aggregate_test_100";
     let actual = execute(&mut ctx, sql).await;
     let expected = vec![vec!["0.6584408483418833"]];
-    assert_eq!(actual, expected);
+    assert_float_eq(&expected, &actual);
     Ok(())
 }
 
@@ -282,7 +480,7 @@ async fn sqrt_f32_vs_f64() -> Result<()> {
     let sql = "SELECT avg(sqrt(CAST(c11 AS double))) FROM aggregate_test_100";
     let actual = execute(&mut ctx, sql).await;
     let expected = vec![vec!["0.6584408483418833"]];
-    assert_eq!(actual, expected);
+    assert_float_eq(&expected, &actual);
     Ok(())
 }
 
@@ -306,7 +504,7 @@ async fn csv_query_sqrt_sqrt() -> Result<()> {
     let actual = execute(&mut ctx, sql).await;
     // sqrt(sqrt(c12=0.9294097332465232)) = 0.9818650561397431
     let expected = vec![vec!["0.9818650561397431"]];
-    assert_eq!(actual, expected);
+    assert_float_eq(&expected, &actual);
     Ok(())
 }
 
@@ -349,7 +547,7 @@ async fn csv_query_avg() -> Result<()> {
     let mut actual = execute(&mut ctx, sql).await;
     actual.sort();
     let expected = vec![vec!["0.5089725099127211"]];
-    assert_eq!(expected, actual);
+    assert_float_eq(&expected, &actual);
     Ok(())
 }
 
@@ -397,7 +595,7 @@ async fn csv_query_avg_multi_batch() -> Result<()> {
     let plan = ctx.create_logical_plan(&sql).unwrap();
     let plan = ctx.optimize(&plan).unwrap();
     let plan = ctx.create_physical_plan(&plan).unwrap();
-    let results = ctx.collect(plan).await.unwrap();
+    let results = collect(plan).await.unwrap();
     let batch = &results[0];
     let column = batch.column(0);
     let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
@@ -406,6 +604,29 @@ async fn csv_query_avg_multi_batch() -> Result<()> {
     // Due to float number's accuracy, different batch size will lead to different
     // answers.
     assert!((expected - actual).abs() < 0.01);
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_query_nullif_divide_by_0() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c8/nullif(c7, 0) FROM aggregate_test_100";
+    let actual = execute(&mut ctx, sql).await;
+    let actual = &actual[80..90]; // We just want to compare rows 80-89
+    let expected = vec![
+        vec!["258"],
+        vec!["664"],
+        vec!["NULL"],
+        vec!["22"],
+        vec!["164"],
+        vec!["448"],
+        vec!["365"],
+        vec!["1640"],
+        vec!["671"],
+        vec!["203"],
+    ];
+    assert_eq!(expected, actual);
     Ok(())
 }
 
@@ -812,6 +1033,249 @@ async fn csv_query_count_one() {
 }
 
 #[tokio::test]
+async fn case_when() -> Result<()> {
+    let mut ctx = create_case_context()?;
+    let sql = "SELECT \
+        CASE WHEN c1 = 'a' THEN 1 \
+             WHEN c1 = 'b' THEN 2 \
+             END \
+        FROM t1";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["1"], vec!["2"], vec!["NULL"], vec!["NULL"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn case_when_else() -> Result<()> {
+    let mut ctx = create_case_context()?;
+    let sql = "SELECT \
+        CASE WHEN c1 = 'a' THEN 1 \
+             WHEN c1 = 'b' THEN 2 \
+             ELSE 999 END \
+        FROM t1";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["1"], vec!["2"], vec!["999"], vec!["999"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn case_when_with_base_expr() -> Result<()> {
+    let mut ctx = create_case_context()?;
+    let sql = "SELECT \
+        CASE c1 WHEN 'a' THEN 1 \
+             WHEN 'b' THEN 2 \
+             END \
+        FROM t1";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["1"], vec!["2"], vec!["NULL"], vec!["NULL"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn case_when_else_with_base_expr() -> Result<()> {
+    let mut ctx = create_case_context()?;
+    let sql = "SELECT \
+        CASE c1 WHEN 'a' THEN 1 \
+             WHEN 'b' THEN 2 \
+             ELSE 999 END \
+        FROM t1";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["1"], vec!["2"], vec!["999"], vec!["999"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+fn create_case_context() -> Result<ExecutionContext> {
+    let mut ctx = ExecutionContext::new();
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8, true)]));
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            None,
+        ]))],
+    )?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
+    ctx.register_table("t1", Box::new(table));
+    Ok(ctx)
+}
+
+#[tokio::test]
+async fn equijoin() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1 JOIN t2 ON t1_id = t2_id ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1 LEFT JOIN t2 ON t1_id = t2_id ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["33", "c", "NULL"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn right_join() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1 RIGHT JOIN t2 ON t1_id = t2_id ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["NULL", "NULL", "w"],
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn left_join_using() -> Result<()> {
+    let mut ctx = create_join_context("id", "id")?;
+    let sql = "SELECT id, t1_name, t2_name FROM t1 LEFT JOIN t2 USING (id) ORDER BY id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["33", "c", "NULL"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn equijoin_implicit_syntax() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1, t2 WHERE t1_id = t2_id ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn equijoin_implicit_syntax_with_filter() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql = "SELECT t1_id, t1_name, t2_name \
+        FROM t1, t2 \
+        WHERE t1_id > 0 \
+        AND t1_id = t2_id \
+        AND t2_id < 99 \
+        ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn equijoin_implicit_syntax_reversed() -> Result<()> {
+    let mut ctx = create_join_context("t1_id", "t2_id")?;
+    let sql =
+        "SELECT t1_id, t1_name, t2_name FROM t1, t2 WHERE t2_id = t1_id ORDER BY t1_id";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["11", "a", "z"],
+        vec!["22", "b", "y"],
+        vec!["44", "d", "x"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cartesian_join() -> Result<()> {
+    let ctx = create_join_context("t1_id", "t2_id")?;
+    let sql = "SELECT t1_id, t1_name, t2_name FROM t1, t2 ORDER BY t1_id";
+    let maybe_plan = ctx.create_logical_plan(&sql);
+    assert_eq!(
+        "This feature is not implemented: Cartesian joins are not supported",
+        &format!("{}", maybe_plan.err().unwrap())
+    );
+    Ok(())
+}
+
+fn create_join_context(
+    column_left: &str,
+    column_right: &str,
+) -> Result<ExecutionContext> {
+    let mut ctx = ExecutionContext::new();
+
+    let t1_schema = Arc::new(Schema::new(vec![
+        Field::new(column_left, DataType::UInt32, true),
+        Field::new("t1_name", DataType::Utf8, true),
+    ]));
+    let t1_data = RecordBatch::try_new(
+        t1_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![11, 22, 33, 44])),
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                Some("b"),
+                Some("c"),
+                Some("d"),
+            ])),
+        ],
+    )?;
+    let t1_table = MemTable::try_new(t1_schema, vec![vec![t1_data]])?;
+    ctx.register_table("t1", Box::new(t1_table));
+
+    let t2_schema = Arc::new(Schema::new(vec![
+        Field::new(column_right, DataType::UInt32, true),
+        Field::new("t2_name", DataType::Utf8, true),
+    ]));
+    let t2_data = RecordBatch::try_new(
+        t2_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![11, 22, 44, 55])),
+            Arc::new(StringArray::from(vec![
+                Some("z"),
+                Some("y"),
+                Some("x"),
+                Some("w"),
+            ])),
+        ],
+    )?;
+    let t2_table = MemTable::try_new(t2_schema, vec![vec![t2_data]])?;
+    ctx.register_table("t2", Box::new(t2_table));
+
+    Ok(ctx)
+}
+
+#[tokio::test]
 async fn csv_explain() {
     let mut ctx = ExecutionContext::new();
     register_aggregate_csv_by_sql(&mut ctx).await;
@@ -868,7 +1332,7 @@ fn aggr_test_schema() -> SchemaRef {
 }
 
 async fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
-    let testdata = env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::arrow_test_data();
 
     // TODO: The following c9 should be migrated to UInt32 and c10 should be UInt64 once
     // unsigned is supported.
@@ -908,7 +1372,7 @@ async fn register_aggregate_csv_by_sql(ctx: &mut ExecutionContext) {
 }
 
 fn register_aggregate_csv(ctx: &mut ExecutionContext) -> Result<()> {
-    let testdata = env::var("ARROW_TEST_DATA").expect("ARROW_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::arrow_test_data();
     let schema = aggr_test_schema();
     ctx.register_csv(
         "aggregate_test_100",
@@ -918,8 +1382,24 @@ fn register_aggregate_csv(ctx: &mut ExecutionContext) -> Result<()> {
     Ok(())
 }
 
+fn register_aggregate_simple_csv(ctx: &mut ExecutionContext) -> Result<()> {
+    // It's not possible to use aggregate_test_100, not enought similar values to test grouping on floats
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c1", DataType::Float32, false),
+        Field::new("c2", DataType::Float64, false),
+        Field::new("c3", DataType::Boolean, false),
+    ]));
+
+    ctx.register_csv(
+        "aggregate_simple",
+        "tests/aggregate_simple.csv",
+        CsvReadOptions::new().schema(&schema),
+    )?;
+    Ok(())
+}
+
 fn register_alltypes_parquet(ctx: &mut ExecutionContext) {
-    let testdata = env::var("PARQUET_TEST_DATA").expect("PARQUET_TEST_DATA not defined");
+    let testdata = arrow::util::test_util::parquet_test_data();
     ctx.register_parquet(
         "alltypes_plain",
         &format!("{}/alltypes_plain.parquet", testdata),
@@ -943,10 +1423,13 @@ async fn execute(ctx: &mut ExecutionContext, sql: &str) -> Vec<Vec<String>> {
     let physical_schema = plan.schema();
 
     let msg = format!("Executing physical plan for '{}': {:?}", sql, plan);
-    let results = ctx.collect(plan).await.expect(&msg);
+    let results = collect(plan).await.expect(&msg);
 
     assert_eq!(logical_schema.as_ref(), optimized_logical_schema.as_ref());
-    assert_eq!(logical_schema.as_ref(), physical_schema.as_ref());
+    assert_eq!(
+        logical_schema.as_ref(),
+        &physical_schema.to_dfschema().unwrap()
+    );
 
     result_vec(&results)
 }
@@ -1004,7 +1487,7 @@ async fn generic_query_length<T: 'static + Array + From<Vec<&'static str>>>(
         vec![Arc::new(T::from(vec!["", "a", "aa", "aaa"]))],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1038,7 +1521,7 @@ async fn query_not() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1064,7 +1547,7 @@ async fn query_concat() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1095,7 +1578,7 @@ async fn query_array() -> Result<()> {
         ],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1119,6 +1602,37 @@ async fn csv_query_sum_cast() {
     let sql = "SELECT c8 + c9 FROM aggregate_test_100";
     // check that the physical and logical schemas are equal
     execute(&mut ctx, sql).await;
+}
+
+#[tokio::test]
+async fn query_where_neg_num() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx).await;
+
+    // Negative numbers do not parse correctly as of Arrow 2.0.0
+    let sql = "select c7, c8 from aggregate_test_100 where c7 >= -2 and c7 < 10";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["7", "45465"],
+        vec!["5", "40622"],
+        vec!["0", "61069"],
+        vec!["2", "20120"],
+        vec!["4", "39363"],
+    ];
+    assert_eq!(expected, actual);
+
+    // Also check floating point neg numbers
+    let sql = "select c7, c8 from aggregate_test_100 where c7 >= -2.9 and c7 < 10";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["7", "45465"],
+        vec!["5", "40622"],
+        vec!["0", "61069"],
+        vec!["2", "20120"],
+        vec!["4", "39363"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
 }
 
 #[tokio::test]
@@ -1153,7 +1667,7 @@ fn make_timestamp_nano_table() -> Result<Box<MemTable>> {
             Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
         ],
     )?;
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
     Ok(Box::new(table))
 }
 
@@ -1183,7 +1697,7 @@ async fn query_is_null() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1207,7 +1721,7 @@ async fn query_is_not_null() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1234,7 +1748,7 @@ async fn query_count_distinct() -> Result<()> {
         ]))],
     )?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
 
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
@@ -1264,7 +1778,7 @@ async fn query_on_string_dictionary() -> Result<()> {
 
     let data = RecordBatch::try_new(schema.clone(), vec![array])?;
 
-    let table = MemTable::new(schema, vec![vec![data]])?;
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
     let mut ctx = ExecutionContext::new();
     ctx.register_table("test", Box::new(table));
 
@@ -1298,5 +1812,240 @@ async fn query_on_string_dictionary() -> Result<()> {
     let expected = vec![vec!["2"]];
     assert_eq!(expected, actual);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_without_from() -> Result<()> {
+    // Test for SELECT <expression> without FROM.
+    // Should evaluate expressions in project position.
+    let mut ctx = ExecutionContext::new();
+
+    let sql = "SELECT 1";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["1"]];
+    assert_eq!(expected, actual);
+
+    let sql = "SELECT 1+2, 3/4, cos(0)";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["3", "0", "1"]];
+    assert_eq!(expected, actual);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_scalar_minus_array() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, true)]));
+
+    let data = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![
+            Some(0),
+            Some(1),
+            None,
+            Some(3),
+        ]))],
+    )?;
+
+    let table = MemTable::try_new(schema, vec![vec![data]])?;
+
+    let mut ctx = ExecutionContext::new();
+    ctx.register_table("test", Box::new(table));
+    let sql = "SELECT 4 - c1 FROM test";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![vec!["4"], vec!["3"], vec!["NULL"], vec!["1"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+fn assert_float_eq<T>(expected: &[Vec<T>], received: &[Vec<String>])
+where
+    T: AsRef<str>,
+{
+    expected
+        .iter()
+        .flatten()
+        .zip(received.iter().flatten())
+        .for_each(|(l, r)| {
+            let (l, r) = (
+                l.as_ref().parse::<f64>().unwrap(),
+                r.as_str().parse::<f64>().unwrap(),
+            );
+            assert!((l - r).abs() <= 2.0 * f64::EPSILON);
+        });
+}
+
+#[tokio::test]
+async fn csv_between_expr() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c4 FROM aggregate_test_100 WHERE c12 BETWEEN 0.995 AND 1.0";
+    let mut actual = execute(&mut ctx, sql).await;
+    actual.sort();
+    let expected = vec![vec!["10837"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn csv_between_expr_negated() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv(&mut ctx)?;
+    let sql = "SELECT c4 FROM aggregate_test_100 WHERE c12 NOT BETWEEN 0 AND 0.995";
+    let mut actual = execute(&mut ctx, sql).await;
+    actual.sort();
+    let expected = vec![vec!["10837"]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn string_expressions() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    let sql = "SELECT
+        char_length('tom') AS char_length
+        ,char_length(NULL) AS char_length_null
+        ,character_length('tom') AS character_length
+        ,character_length(NULL) AS character_length_null
+        ,lower('TOM') AS lower
+        ,lower(NULL) AS lower_null
+        ,upper('tom') AS upper
+        ,upper(NULL) AS upper_null
+        ,trim(' tom ') AS trim
+        ,trim(NULL) AS trim_null
+        ,ltrim(' tom ') AS trim_left
+        ,rtrim(' tom ') AS trim_right
+    ";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![vec![
+        "3", "NULL", "3", "NULL", "tom", "NULL", "TOM", "NULL", "tom", "NULL", "tom ",
+        " tom",
+    ]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn crypto_expressions() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    let sql = "SELECT
+        md5('tom') AS md5_tom,
+        md5('') AS md5_empty_str,
+        md5(null) AS md5_null,
+        sha224('tom') AS sha224_tom,
+        sha224('') AS sha224_empty_str,
+        sha224(null) AS sha224_null,
+        sha256('tom') AS sha256_tom,
+        sha256('') AS sha256_empty_str,
+        sha384('tom') AS sha348_tom,
+        sha384('') AS sha384_empty_str,
+        sha512('tom') AS sha512_tom,
+        sha512('') AS sha512_empty_str
+    ";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![vec![
+        "34b7da764b21d298ef307d04d8152dc5",
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "NULL",
+        "0bf6cb62649c42a9ae3876ab6f6d92ad36cb5414e495f8873292be4d",
+        "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f",
+        "NULL",
+        "e1608f75c5d7813f3d4031cb30bfb786507d98137538ff8e128a6ff74e84e643",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "096f5b68aa77848e4fdf5c1c0b350de2dbfad60ffd7c25d9ea07c6c19b8a4d55a9187eb117c557883f58c16dfac3e343",
+        "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b",
+        "6e1b9b3fe840680e37051f7ad5e959d6f39ad0f8885d855166f55c659469d3c8b78118c44a2a49c72ddb481cd6d8731034e11cc030070ba843a90b3495cb8d3e",
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    ]];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_list_array() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    register_aggregate_csv_by_sql(&mut ctx).await;
+    let sql = "SELECT
+            c1 IN ('a', 'c') AS utf8_in_true
+            ,c1 IN ('x', 'y') AS utf8_in_false
+            ,c1 NOT IN ('x', 'y') AS utf8_not_in_true
+            ,c1 NOT IN ('a', 'c') AS utf8_not_in_false
+            ,CAST(CAST(c1 AS int) AS varchar) IN ('a', 'c') AS utf8_in_null
+        FROM aggregate_test_100 WHERE c12 < 0.05";
+    let actual = execute(&mut ctx, sql).await;
+    let expected = vec![
+        vec!["true", "false", "true", "false", "NULL"],
+        vec!["true", "false", "true", "false", "NULL"],
+        vec!["true", "false", "true", "false", "NULL"],
+        vec!["false", "false", "true", "true", "NULL"],
+        vec!["false", "false", "true", "true", "NULL"],
+        vec!["false", "false", "true", "true", "NULL"],
+        vec!["false", "false", "true", "true", "NULL"],
+    ];
+    assert_eq!(expected, actual);
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_list_scalar() -> Result<()> {
+    let mut ctx = ExecutionContext::new();
+    let sql = "SELECT
+        'a' IN ('a','b') AS utf8_in_true
+        ,'c' IN ('a','b') AS utf8_in_false
+        ,'c' NOT IN ('a','b') AS utf8_not_in_true
+        ,'a' NOT IN ('a','b') AS utf8_not_in_false
+        ,NULL IN ('a','b') AS utf8_in_null
+        ,NULL NOT IN ('a','b') AS utf8_not_in_null
+        ,'a' IN ('a','b',NULL) AS utf8_in_null_true
+        ,'c' IN ('a','b',NULL) AS utf8_in_null_null
+        ,'a' NOT IN ('a','b',NULL) AS utf8_not_in_null_false
+        ,'c' NOT IN ('a','b',NULL) AS utf8_not_in_null_null
+
+        ,0 IN (0,1,2) AS int64_in_true
+        ,3 IN (0,1,2) AS int64_in_false
+        ,3 NOT IN (0,1,2) AS int64_not_in_true
+        ,0 NOT IN (0,1,2) AS int64_not_in_false
+        ,NULL IN (0,1,2) AS int64_in_null
+        ,NULL NOT IN (0,1,2) AS int64_not_in_null
+        ,0 IN (0,1,2,NULL) AS int64_in_null_true
+        ,3 IN (0,1,2,NULL) AS int64_in_null_null
+        ,0 NOT IN (0,1,2,NULL) AS int64_not_in_null_false
+        ,3 NOT IN (0,1,2,NULL) AS int64_not_in_null_null
+
+        ,0.0 IN (0.0,0.1,0.2) AS float64_in_true
+        ,0.3 IN (0.0,0.1,0.2) AS float64_in_false
+        ,0.3 NOT IN (0.0,0.1,0.2) AS float64_not_in_true
+        ,0.0 NOT IN (0.0,0.1,0.2) AS float64_not_in_false
+        ,NULL IN (0.0,0.1,0.2) AS float64_in_null
+        ,NULL NOT IN (0.0,0.1,0.2) AS float64_not_in_null
+        ,0.0 IN (0.0,0.1,0.2,NULL) AS float64_in_null_true
+        ,0.3 IN (0.0,0.1,0.2,NULL) AS float64_in_null_null
+        ,0.0 NOT IN (0.0,0.1,0.2,NULL) AS float64_not_in_null_false
+        ,0.3 NOT IN (0.0,0.1,0.2,NULL) AS float64_not_in_null_null
+
+        ,'1' IN ('a','b',1) AS utf8_cast_in_true
+        ,'2' IN ('a','b',1) AS utf8_cast_in_false
+        ,'2' NOT IN ('a','b',1) AS utf8_cast_not_in_true
+        ,'1' NOT IN ('a','b',1) AS utf8_cast_not_in_false
+        ,NULL IN ('a','b',1) AS utf8_cast_in_null
+        ,NULL NOT IN ('a','b',1) AS utf8_cast_not_in_null
+        ,'1' IN ('a','b',NULL,1) AS utf8_cast_in_null_true
+        ,'2' IN ('a','b',NULL,1) AS utf8_cast_in_null_null
+        ,'1' NOT IN ('a','b',NULL,1) AS utf8_cast_not_in_null_false
+        ,'2' NOT IN ('a','b',NULL,1) AS utf8_cast_not_in_null_null
+    ";
+    let actual = execute(&mut ctx, sql).await;
+
+    let expected = vec![vec![
+        "true", "false", "true", "false", "NULL", "NULL", "true", "NULL", "false",
+        "NULL", "true", "false", "true", "false", "NULL", "NULL", "true", "NULL",
+        "false", "NULL", "true", "false", "true", "false", "NULL", "NULL", "true",
+        "NULL", "false", "NULL", "true", "false", "true", "false", "NULL", "NULL",
+        "true", "NULL", "false", "NULL",
+    ]];
+    assert_eq!(expected, actual);
     Ok(())
 }

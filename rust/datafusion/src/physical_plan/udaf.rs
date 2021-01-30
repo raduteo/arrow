@@ -64,6 +64,12 @@ impl Debug for AggregateUDF {
     }
 }
 
+impl PartialEq for AggregateUDF {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.signature == other.signature
+    }
+}
+
 impl AggregateUDF {
     /// Create a new AggregateUDF
     pub fn new(
@@ -112,7 +118,7 @@ pub fn create_aggregate_expr(
         fun: fun.clone(),
         args: args.clone(),
         data_type: (fun.return_type)(&arg_types)?.as_ref().clone(),
-        name: name.clone(),
+        name,
     }))
 }
 

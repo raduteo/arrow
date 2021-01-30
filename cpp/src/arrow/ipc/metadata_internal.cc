@@ -428,8 +428,7 @@ static Status GetDictionaryEncoding(FBB& fbb, const std::shared_ptr<Field>& fiel
                                     const DictionaryType& type, int64_t dictionary_id,
                                     DictionaryOffset* out) {
   // We assume that the dictionary index type (as an integer) has already been
-  // validated elsewhere, and can safely assume we are dealing with signed
-  // integers
+  // validated elsewhere, and can safely assume we are dealing with integers
   const auto& index_type = checked_cast<const IntegerType&>(*type.index_type());
 
   auto index_type_offset =
@@ -869,12 +868,12 @@ Status SchemaToFlatbuffer(FBB& fbb, const Schema& schema,
 Result<std::shared_ptr<Buffer>> WriteFBMessage(
     FBB& fbb, flatbuf::MessageHeader header_type, flatbuffers::Offset<void> header,
     int64_t body_length, MetadataVersion version,
-    const std::shared_ptr<const KeyValueMetadata>& custom_metadata = nullptr) {
+    const std::shared_ptr<const KeyValueMetadata>& custom_metadata, MemoryPool* pool) {
   auto message = flatbuf::CreateMessage(fbb, MetadataVersionToFlatbuffer(version),
                                         header_type, header, body_length,
                                         SerializeCustomMetadata(fbb, custom_metadata));
   fbb.Finish(message);
-  return WriteFlatbufferBuilder(fbb);
+  return WriteFlatbufferBuilder(fbb, pool);
 }
 
 using FieldNodeVector =
@@ -1181,7 +1180,8 @@ Status WriteSchemaMessage(const Schema& schema, const DictionaryFieldMapper& map
   flatbuffers::Offset<flatbuf::Schema> fb_schema;
   RETURN_NOT_OK(SchemaToFlatbuffer(fbb, schema, mapper, &fb_schema));
   return WriteFBMessage(fbb, flatbuf::MessageHeader::Schema, fb_schema.Union(),
-                        /*body_length=*/0, options.metadata_version)
+                        /*body_length=*/0, options.metadata_version,
+                        /*custom_metadata=*/nullptr, options.memory_pool)
       .Value(out);
 }
 
@@ -1195,7 +1195,8 @@ Status WriteRecordBatchMessage(
   RETURN_NOT_OK(
       MakeRecordBatch(fbb, length, body_length, nodes, buffers, options, &record_batch));
   return WriteFBMessage(fbb, flatbuf::MessageHeader::RecordBatch, record_batch.Union(),
-                        body_length, options.metadata_version, custom_metadata)
+                        body_length, options.metadata_version, custom_metadata,
+                        options.memory_pool)
       .Value(out);
 }
 
@@ -1229,7 +1230,8 @@ Result<std::shared_ptr<Buffer>> WriteTensorMessage(const Tensor& tensor,
       flatbuf::CreateTensor(fbb, fb_type_type, fb_type, fb_shape, fb_strides, &buffer);
 
   return WriteFBMessage(fbb, flatbuf::MessageHeader::Tensor, fb_tensor.Union(),
-                        body_length, options.metadata_version);
+                        body_length, options.metadata_version,
+                        /*custom_metadata=*/nullptr, options.memory_pool);
 }
 
 Result<std::shared_ptr<Buffer>> WriteSparseTensorMessage(
@@ -1240,7 +1242,8 @@ Result<std::shared_ptr<Buffer>> WriteSparseTensorMessage(
   RETURN_NOT_OK(
       MakeSparseTensor(fbb, sparse_tensor, body_length, buffers, &fb_sparse_tensor));
   return WriteFBMessage(fbb, flatbuf::MessageHeader::SparseTensor,
-                        fb_sparse_tensor.Union(), body_length, options.metadata_version);
+                        fb_sparse_tensor.Union(), body_length, options.metadata_version,
+                        /*custom_metadata=*/nullptr, options.memory_pool);
 }
 
 Status WriteDictionaryMessage(
@@ -1255,7 +1258,8 @@ Status WriteDictionaryMessage(
   auto dictionary_batch =
       flatbuf::CreateDictionaryBatch(fbb, id, record_batch, is_delta).Union();
   return WriteFBMessage(fbb, flatbuf::MessageHeader::DictionaryBatch, dictionary_batch,
-                        body_length, options.metadata_version, custom_metadata)
+                        body_length, options.metadata_version, custom_metadata,
+                        options.memory_pool)
       .Value(out);
 }
 
@@ -1345,9 +1349,9 @@ Status GetTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type
     return Status::IOError("Header-type of flatbuffer-encoded Message is not Tensor.");
   }
 
-  int ndim = static_cast<int>(tensor->shape()->size());
+  flatbuffers::uoffset_t ndim = tensor->shape()->size();
 
-  for (int i = 0; i < ndim; ++i) {
+  for (flatbuffers::uoffset_t i = 0; i < ndim; ++i) {
     auto dim = tensor->shape()->Get(i);
 
     shape->push_back(dim->size());
@@ -1355,7 +1359,12 @@ Status GetTensorMetadata(const Buffer& metadata, std::shared_ptr<DataType>* type
   }
 
   if (tensor->strides() && tensor->strides()->size() > 0) {
-    for (int i = 0; i < ndim; ++i) {
+    if (tensor->strides()->size() != ndim) {
+      return Status::IOError(
+          "The sizes of shape and strides in a tensor are mismatched.");
+    }
+
+    for (decltype(ndim) i = 0; i < ndim; ++i) {
       strides->push_back(tensor->strides()->Get(i));
     }
   }

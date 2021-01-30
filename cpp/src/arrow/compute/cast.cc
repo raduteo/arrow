@@ -135,7 +135,7 @@ CastFunction::CastFunction(std::string name, Type::type out_type)
   impl_->out_type = out_type;
 }
 
-CastFunction::~CastFunction() {}
+CastFunction::~CastFunction() = default;
 
 Type::type CastFunction::out_type_id() const { return impl_->out_type; }
 
@@ -163,7 +163,7 @@ bool CastFunction::CanCastTo(const DataType& out_type) const {
   return impl_->in_types.find(static_cast<int>(out_type.id())) != impl_->in_types.end();
 }
 
-Result<const ScalarKernel*> CastFunction::DispatchExact(
+Result<const Kernel*> CastFunction::DispatchExact(
     const std::vector<ValueDescr>& values) const {
   const int passed_num_args = static_cast<int>(values.size());
 

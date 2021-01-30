@@ -49,6 +49,7 @@
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging.h"
 #include "arrow/util/parallel.h"
+#include "arrow/util/string.h"
 #include "arrow/util/ubsan.h"
 #include "arrow/visitor_inline.h"
 
@@ -535,8 +536,9 @@ Status GetCompressionExperimental(const flatbuf::Message* message,
     RETURN_NOT_OK(internal::GetKeyValueMetadata(message->custom_metadata(), &metadata));
     int index = metadata->FindKey("ARROW:experimental_compression");
     if (index != -1) {
-      ARROW_ASSIGN_OR_RAISE(*out,
-                            util::Codec::GetCompressionType(metadata->value(index)));
+      // Arrow 0.17 stored string in upper case, internal utils now require lower case
+      auto name = arrow::internal::AsciiToLower(metadata->value(index));
+      ARROW_ASSIGN_OR_RAISE(*out, util::Codec::GetCompressionType(name));
     }
     return internal::CheckCompressionSupported(*out);
   }
@@ -1051,7 +1053,9 @@ class RecordBatchFileReaderImpl : public RecordBatchFileReader {
         file_->ReadAt(footer_offset_ - footer_length - file_end_size, footer_length));
 
     auto data = footer_buffer_->data();
-    flatbuffers::Verifier verifier(data, footer_buffer_->size(), 128);
+    flatbuffers::Verifier verifier(data, footer_buffer_->size(), /*max_depth=*/128,
+                                   /*max_tables=*/UINT_MAX);
+
     if (!flatbuf::VerifyFooterBuffer(verifier)) {
       return Status::IOError("Verification of flatbuffer-encoded Footer failed.");
     }
@@ -1142,20 +1146,16 @@ class StreamDecoder::StreamDecoderImpl : public MessageDecoderListener {
   };
 
  public:
-  explicit StreamDecoderImpl(std::shared_ptr<Listener> listener,
-                             const IpcReadOptions& options)
-      : MessageDecoderListener(),
-        listener_(std::move(listener)),
-        options_(options),
+  explicit StreamDecoderImpl(std::shared_ptr<Listener> listener, IpcReadOptions options)
+      : listener_(std::move(listener)),
+        options_(std::move(options)),
         state_(State::SCHEMA),
         message_decoder_(std::shared_ptr<StreamDecoderImpl>(this, [](void*) {}),
                          options_.memory_pool),
-        field_inclusion_mask_(),
-        n_required_dictionaries_(0),
-        dictionary_memo_(),
-        schema_() {}
+        n_required_dictionaries_(0) {}
 
   Status OnMessageDecoded(std::unique_ptr<Message> message) override {
+    ++stats_.num_messages;
     switch (state_) {
       case State::SCHEMA:
         ARROW_RETURN_NOT_OK(OnSchemaMessageDecoded(std::move(message)));
@@ -1188,6 +1188,8 @@ class StreamDecoder::StreamDecoderImpl : public MessageDecoderListener {
   std::shared_ptr<Schema> schema() const { return out_schema_; }
 
   int64_t next_required_size() const { return message_decoder_.next_required_size(); }
+
+  ReadStats stats() const { return stats_; }
 
  private:
   Status OnSchemaMessageDecoded(std::unique_ptr<Message> message) {
@@ -1229,30 +1231,42 @@ class StreamDecoder::StreamDecoderImpl : public MessageDecoderListener {
           auto batch,
           ReadRecordBatchInternal(*message->metadata(), schema_, field_inclusion_mask_,
                                   &dictionary_memo_, options_, reader.get()));
+      ++stats_.num_record_batches;
       return listener_->OnRecordBatchDecoded(std::move(batch));
     }
   }
 
   // Read dictionary from dictionary batch
   Status ReadDictionary(const Message& message) {
-    // TODO accumulate and expose ReadStats
-    DictionaryKind unused_kind;
-    return ::arrow::ipc::ReadDictionary(message, &dictionary_memo_, options_,
-                                        &unused_kind);
+    DictionaryKind kind;
+    RETURN_NOT_OK(
+        ::arrow::ipc::ReadDictionary(message, &dictionary_memo_, options_, &kind));
+    ++stats_.num_dictionary_batches;
+    switch (kind) {
+      case DictionaryKind::New:
+        break;
+      case DictionaryKind::Delta:
+        ++stats_.num_dictionary_deltas;
+        break;
+      case DictionaryKind::Replacement:
+        ++stats_.num_replaced_dictionaries;
+        break;
+    }
+    return Status::OK();
   }
 
   std::shared_ptr<Listener> listener_;
-  IpcReadOptions options_;
+  const IpcReadOptions options_;
   State state_;
   MessageDecoder message_decoder_;
   std::vector<bool> field_inclusion_mask_;
   int n_required_dictionaries_;
   DictionaryMemo dictionary_memo_;
   std::shared_ptr<Schema> schema_, out_schema_;
+  ReadStats stats_;
 };
 
-StreamDecoder::StreamDecoder(std::shared_ptr<Listener> listener,
-                             const IpcReadOptions& options) {
+StreamDecoder::StreamDecoder(std::shared_ptr<Listener> listener, IpcReadOptions options) {
   impl_.reset(new StreamDecoderImpl(std::move(listener), options));
 }
 
@@ -1268,6 +1282,8 @@ Status StreamDecoder::Consume(std::shared_ptr<Buffer> buffer) {
 std::shared_ptr<Schema> StreamDecoder::schema() const { return impl_->schema(); }
 
 int64_t StreamDecoder::next_required_size() const { return impl_->next_required_size(); }
+
+ReadStats StreamDecoder::stats() const { return impl_->stats(); }
 
 Result<std::shared_ptr<Schema>> ReadSchema(io::InputStream* stream,
                                            DictionaryMemo* dictionary_memo) {
@@ -1728,6 +1744,23 @@ Status FuzzIpcFile(const uint8_t* data, int64_t size) {
   for (int i = 0; i < n_batches; ++i) {
     ARROW_ASSIGN_OR_RAISE(auto batch, batch_reader->ReadRecordBatch(i));
     RETURN_NOT_OK(batch->ValidateFull());
+  }
+
+  return Status::OK();
+}
+
+Status FuzzIpcTensorStream(const uint8_t* data, int64_t size) {
+  auto buffer = std::make_shared<Buffer>(data, size);
+  io::BufferReader buffer_reader(buffer);
+
+  std::shared_ptr<Tensor> tensor;
+
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(tensor, ReadTensor(&buffer_reader));
+    if (tensor == nullptr) {
+      break;
+    }
+    RETURN_NOT_OK(tensor->Validate());
   }
 
   return Status::OK();

@@ -18,17 +18,24 @@
 //! Defines the SORT plan
 
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use arrow::array::ArrayRef;
+use futures::stream::Stream;
+use futures::Future;
+
+use pin_project_lite::pin_project;
+
 pub use arrow::compute::SortOptions;
 use arrow::compute::{concat, lexsort_to_indices, take, SortColumn, TakeOptions};
 use arrow::datatypes::SchemaRef;
+use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
+use arrow::{array::ArrayRef, error::ArrowError};
 
-use super::SendableRecordBatchStream;
+use super::{RecordBatchStream, SendableRecordBatchStream};
 use crate::error::{DataFusionError, Result};
-use crate::physical_plan::common::SizedRecordBatchStream;
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::{common, Distribution, ExecutionPlan, Partitioning};
 
@@ -58,6 +65,16 @@ impl SortExec {
             concurrency,
         })
     }
+
+    /// Input schema
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// Sort expressions
+    pub fn expr(&self) -> &[PhysicalSortExpr] {
+        &self.expr
+    }
 }
 
 #[async_trait]
@@ -68,7 +85,7 @@ impl ExecutionPlan for SortExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.input.schema().clone()
+        self.input.schema()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -114,70 +131,145 @@ impl ExecutionPlan for SortExec {
                 "SortExec requires a single input partition".to_owned(),
             ));
         }
-        let it = self.input.execute(0).await?;
-        let batches = common::collect(it).await?;
+        let input = self.input.execute(0).await?;
 
-        // combine all record batches into one for each column
-        let combined_batch = RecordBatch::try_new(
-            self.schema(),
-            self.schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(i, _)| -> Result<ArrayRef> {
-                    Ok(concat(
-                        &batches
-                            .iter()
-                            .map(|batch| batch.columns()[i].clone())
-                            .collect::<Vec<ArrayRef>>(),
-                    )?)
-                })
-                .collect::<Result<Vec<ArrayRef>>>()?,
-        )?;
+        Ok(Box::pin(SortStream::new(input, self.expr.clone())))
+    }
+}
 
-        // sort combined record batch
-        let indices = lexsort_to_indices(
-            &self
-                .expr
-                .iter()
-                .map(|e| e.evaluate_to_sort_column(&combined_batch))
-                .collect::<Result<Vec<SortColumn>>>()?,
-        )?;
+fn sort_batches(
+    batches: &Vec<RecordBatch>,
+    schema: &SchemaRef,
+    expr: &[PhysicalSortExpr],
+) -> ArrowResult<Option<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(None);
+    }
+    // combine all record batches into one for each column
+    let combined_batch = RecordBatch::try_new(
+        schema.clone(),
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                concat(
+                    &batches
+                        .iter()
+                        .map(|batch| batch.column(i).as_ref())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<ArrowResult<Vec<ArrayRef>>>()?,
+    )?;
 
-        // reorder all rows based on sorted indices
-        let sorted_batch = RecordBatch::try_new(
-            self.schema(),
-            combined_batch
-                .columns()
-                .iter()
-                .map(|column| -> Result<ArrayRef> {
-                    Ok(take(
-                        column,
-                        &indices,
-                        // disable bound check overhead since indices are already generated from
-                        // the same record batch
-                        Some(TakeOptions {
-                            check_bounds: false,
-                        }),
-                    )?)
-                })
-                .collect::<Result<Vec<ArrayRef>>>()?,
-        )?;
+    // sort combined record batch
+    let indices = lexsort_to_indices(
+        &expr
+            .iter()
+            .map(|e| e.evaluate_to_sort_column(&combined_batch))
+            .collect::<Result<Vec<SortColumn>>>()
+            .map_err(DataFusionError::into_arrow_external_error)?,
+    )?;
 
-        Ok(Box::pin(SizedRecordBatchStream::new(
-            self.schema(),
-            vec![Arc::new(sorted_batch)],
-        )))
+    // reorder all rows based on sorted indices
+    let sorted_batch = RecordBatch::try_new(
+        schema.clone(),
+        combined_batch
+            .columns()
+            .iter()
+            .map(|column| {
+                take(
+                    column.as_ref(),
+                    &indices,
+                    // disable bound check overhead since indices are already generated from
+                    // the same record batch
+                    Some(TakeOptions {
+                        check_bounds: false,
+                    }),
+                )
+            })
+            .collect::<ArrowResult<Vec<ArrayRef>>>()?,
+    );
+    sorted_batch.map(Some)
+}
+
+pin_project! {
+    struct SortStream {
+        #[pin]
+        output: futures::channel::oneshot::Receiver<ArrowResult<Option<RecordBatch>>>,
+        finished: bool,
+        schema: SchemaRef,
+    }
+}
+
+impl SortStream {
+    fn new(input: SendableRecordBatchStream, expr: Vec<PhysicalSortExpr>) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+
+        let schema = input.schema();
+        tokio::spawn(async move {
+            let schema = input.schema();
+            let sorted_batch = common::collect(input)
+                .await
+                .map_err(DataFusionError::into_arrow_external_error)
+                .and_then(move |batches| sort_batches(&batches, &schema, &expr));
+
+            tx.send(sorted_batch)
+        });
+
+        Self {
+            output: rx,
+            finished: false,
+            schema,
+        }
+    }
+}
+
+impl Stream for SortStream {
+    type Item = ArrowResult<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+
+        // is the output ready?
+        let this = self.project();
+        let output_poll = this.output.poll(cx);
+
+        match output_poll {
+            Poll::Ready(result) => {
+                *this.finished = true;
+
+                // check for error in receiving channel and unwrap actual result
+                let result = match result {
+                    Err(e) => Some(Err(ArrowError::ExternalError(Box::new(e)))), // error receiving
+                    Ok(result) => result.transpose(),
+                };
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for SortStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::physical_plan::csv::{CsvExec, CsvReadOptions};
     use crate::physical_plan::expressions::col;
     use crate::physical_plan::memory::MemoryExec;
     use crate::physical_plan::merge::MergeExec;
+    use crate::physical_plan::{
+        collect,
+        csv::{CsvExec, CsvReadOptions},
+    };
     use crate::test;
     use arrow::array::*;
     use arrow::datatypes::*;
@@ -212,7 +304,7 @@ mod tests {
             2,
         )?);
 
-        let result: Vec<RecordBatch> = test::execute(sort_exec).await?;
+        let result: Vec<RecordBatch> = collect(sort_exec).await?;
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();
@@ -290,7 +382,7 @@ mod tests {
         assert_eq!(DataType::Float32, *sort_exec.schema().field(0).data_type());
         assert_eq!(DataType::Float64, *sort_exec.schema().field(1).data_type());
 
-        let result: Vec<RecordBatch> = test::execute(sort_exec).await?;
+        let result: Vec<RecordBatch> = collect(sort_exec).await?;
         assert_eq!(result.len(), 1);
 
         let columns = result[0].columns();

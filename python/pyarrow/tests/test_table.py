@@ -105,6 +105,15 @@ def test_chunked_array_construction():
     assert pa.chunked_array([[]], type=pa.string()).type == pa.string()
 
 
+def test_combine_chunks():
+    # ARROW-77363
+    arr = pa.array([1, 2])
+    chunked_arr = pa.chunked_array([arr, arr])
+    res = chunked_arr.combine_chunks()
+    expected = pa.array([1, 2, 1, 2])
+    assert res.equals(expected)
+
+
 def test_chunked_array_to_numpy():
     data = pa.chunked_array([
         [1, 2, 3],
@@ -553,6 +562,48 @@ def test_recordbatch_pickle():
     result = pickle.loads(pickle.dumps(batch))
     assert result.equals(batch)
     assert result.schema == schema
+
+
+def test_recordbatch_get_field():
+    data = [
+        pa.array(range(5)),
+        pa.array([-10, -5, 0, 5, 10]),
+        pa.array(range(5, 10))
+    ]
+    batch = pa.RecordBatch.from_arrays(data, names=('a', 'b', 'c'))
+
+    assert batch.field('a').equals(batch.schema.field('a'))
+    assert batch.field(0).equals(batch.schema.field('a'))
+
+    with pytest.raises(KeyError):
+        batch.field('d')
+
+    with pytest.raises(TypeError):
+        batch.field(None)
+
+    with pytest.raises(IndexError):
+        batch.field(4)
+
+
+def test_recordbatch_select_column():
+    data = [
+        pa.array(range(5)),
+        pa.array([-10, -5, 0, 5, 10]),
+        pa.array(range(5, 10))
+    ]
+    batch = pa.RecordBatch.from_arrays(data, names=('a', 'b', 'c'))
+
+    assert batch.column('a').equals(batch.column(0))
+
+    with pytest.raises(
+            KeyError, match='Field "d" does not exist in record batch schema'):
+        batch.column('d')
+
+    with pytest.raises(TypeError):
+        batch.column(None)
+
+    with pytest.raises(IndexError):
+        batch.column(4)
 
 
 def test_recordbatch_from_struct_array_invalid():

@@ -27,10 +27,11 @@ extern crate arrow;
 use arrow::array::*;
 use arrow::compute::kernels::arithmetic::*;
 use arrow::compute::kernels::limit::*;
+use arrow::util::test_util::seedable_rng;
 
 fn create_array(size: usize, with_nulls: bool) -> ArrayRef {
     // use random numbers to avoid spurious compiler optimizations wrt to branching
-    let mut rng = rand::thread_rng();
+    let mut rng = seedable_rng();
     let mut builder = Float32Builder::new(size);
 
     for _ in 0..size {
@@ -68,7 +69,7 @@ fn bench_divide(arr_a: &ArrayRef, arr_b: &ArrayRef) {
 }
 
 fn bench_limit(arr_a: &ArrayRef, max: usize) {
-    criterion::black_box(limit(arr_a, max).unwrap());
+    criterion::black_box(limit(arr_a, max));
 }
 
 fn add_benchmark(c: &mut Criterion) {

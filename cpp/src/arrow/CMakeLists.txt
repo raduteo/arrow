@@ -197,6 +197,7 @@ set(ARROW_SRCS
     util/string.cc
     util/string_builder.cc
     util/task_group.cc
+    util/tdigest.cc
     util/thread_pool.cc
     util/time.cc
     util/trie.cc
@@ -365,6 +366,7 @@ if(ARROW_COMPUTE)
               compute/registry.cc
               compute/kernels/aggregate_basic.cc
               compute/kernels/aggregate_mode.cc
+              compute/kernels/aggregate_quantile.cc
               compute/kernels/aggregate_var_std.cc
               compute/kernels/codegen_internal.cc
               compute/kernels/scalar_arithmetic.cc
@@ -622,12 +624,15 @@ add_arrow_test(table_test
 add_arrow_test(tensor_test)
 add_arrow_test(sparse_tensor_test)
 
+set(STL_TEST_SRCS stl_iterator_test.cc)
 if(ARROW_COMPUTE)
   # This unit test uses compute code
-  add_arrow_test(stl_test)
+  list(APPEND STL_TEST_SRCS stl_test.cc)
 endif()
+add_arrow_test(stl_test SOURCES ${STL_TEST_SRCS})
 
 add_arrow_benchmark(builder_benchmark)
+add_arrow_benchmark(compare_benchmark)
 add_arrow_benchmark(memory_pool_benchmark)
 add_arrow_benchmark(type_benchmark)
 

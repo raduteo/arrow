@@ -39,6 +39,7 @@ on:
 
 env:
   DOCKER_BUILDKIT: 0
+  DOCKER_VOLUME_PREFIX: ".docker/"
   COMPOSE_DOCKER_CLI_BUILD: 1
   ARROW_ENABLE_TIMING_TESTS: OFF
   ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
@@ -218,7 +219,9 @@ jobs:
       - name: Install Dependencies
         shell: bash
         run: |
+          rm -f /usr/local/bin/2to3
           brew update --preinstall
+          brew unlink gcc@8 gcc@9
           brew bundle --file=cpp/Brewfile
       - name: Build
         shell: bash
@@ -338,7 +341,6 @@ jobs:
       CMAKE_ARGS: >-
         -DARROW_PACKAGE_PREFIX=/mingw${{ matrix.mingw-n-bits }}
         -DBoost_NO_BOOST_CMAKE=ON
-      CMAKE_GENERATOR: MSYS Makefiles
       CMAKE_UNITY_BUILD: ON
     steps:
       - name: Disable Crash Dialogs

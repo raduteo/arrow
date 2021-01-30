@@ -238,6 +238,10 @@ impl List {
     pub fn len(&self) -> usize {
         self.elements.len()
     }
+
+    pub fn elements(&self) -> &[Field] {
+        self.elements.as_slice()
+    }
 }
 
 /// Constructs a `List` from the list of `fields` and returns it.
@@ -355,6 +359,10 @@ impl Map {
     /// Get the number of fields in this row
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn entries(&self) -> &[(Field, Field)] {
+        self.entries.as_slice()
     }
 }
 
@@ -529,12 +537,10 @@ impl Field {
 
     /// Determines if this Row represents a primitive value.
     pub fn is_primitive(&self) -> bool {
-        match *self {
-            Field::Group(_) => false,
-            Field::ListInternal(_) => false,
-            Field::MapInternal(_) => false,
-            _ => true,
-        }
+        !matches!(
+            *self,
+            Field::Group(_) | Field::ListInternal(_) | Field::MapInternal(_)
+        )
     }
 
     /// Converts Parquet BOOLEAN type with logical type into `bool` value.
@@ -645,14 +651,14 @@ impl fmt::Display for Field {
             Field::UInt(value) => write!(f, "{}", value),
             Field::ULong(value) => write!(f, "{}", value),
             Field::Float(value) => {
-                if value > 1e19 || value < 1e-15 {
+                if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
                 } else {
                     write!(f, "{:?}", value)
                 }
             }
             Field::Double(value) => {
-                if value > 1e19 || value < 1e-15 {
+                if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
                 } else {
                     write!(f, "{:?}", value)
@@ -763,7 +769,7 @@ fn convert_decimal_to_string(decimal: &Decimal) -> String {
 mod tests {
     use super::*;
 
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::schema::types::{ColumnDescriptor, ColumnPath, PrimitiveTypeBuilder};
 
@@ -774,9 +780,8 @@ mod tests {
                 .with_logical_type($logical_type)
                 .build()
                 .unwrap();
-            Rc::new(ColumnDescriptor::new(
-                Rc::new(tpe),
-                None,
+            Arc::new(ColumnDescriptor::new(
+                Arc::new(tpe),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -790,9 +795,8 @@ mod tests {
                 .with_scale($scale)
                 .build()
                 .unwrap();
-            Rc::new(ColumnDescriptor::new(
-                Rc::new(tpe),
-                None,
+            Arc::new(ColumnDescriptor::new(
+                Arc::new(tpe),
                 0,
                 0,
                 ColumnPath::from("col"),
@@ -1603,5 +1607,67 @@ mod tests {
                 map.get_values().get_string(i).unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::approx_constant, clippy::many_single_char_names)]
+mod api_tests {
+    use super::{make_list, make_map, make_row};
+    use crate::record::Field;
+
+    #[test]
+    fn test_field_visibility() {
+        let row = make_row(vec![(
+            "a".to_string(),
+            Field::Group(make_row(vec![
+                ("x".to_string(), Field::Null),
+                ("Y".to_string(), Field::Int(2)),
+            ])),
+        )]);
+
+        match row.get_column_iter().next() {
+            Some(column) => {
+                assert_eq!("a", column.0);
+                match column.1 {
+                    Field::Group(r) => {
+                        assert_eq!(
+                            &make_row(vec![
+                                ("x".to_string(), Field::Null),
+                                ("Y".to_string(), Field::Int(2)),
+                            ]),
+                            r
+                        );
+                    }
+                    _ => panic!("Expected the first column to be Field::Group"),
+                }
+            }
+            None => panic!("Expected at least one column"),
+        }
+    }
+
+    #[test]
+    fn test_list_element_access() {
+        let expected = vec![
+            Field::Int(1),
+            Field::Group(make_row(vec![
+                ("x".to_string(), Field::Null),
+                ("Y".to_string(), Field::Int(2)),
+            ])),
+        ];
+
+        let list = make_list(expected.clone());
+        assert_eq!(expected.as_slice(), list.elements());
+    }
+
+    #[test]
+    fn test_map_entry_access() {
+        let expected = vec![
+            (Field::Str("one".to_owned()), Field::Int(1)),
+            (Field::Str("two".to_owned()), Field::Int(2)),
+        ];
+
+        let map = make_map(expected.clone());
+        assert_eq!(expected.as_slice(), map.entries());
     }
 }

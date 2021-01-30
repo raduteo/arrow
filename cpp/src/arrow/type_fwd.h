@@ -60,7 +60,6 @@ using FieldVector = std::vector<std::shared_ptr<Field>>;
 class Array;
 struct ArrayData;
 class ArrayBuilder;
-class Tensor;
 struct Scalar;
 
 using ArrayDataVector = std::vector<std::shared_ptr<ArrayData>>;
@@ -71,6 +70,8 @@ class ChunkedArray;
 class RecordBatch;
 class RecordBatchReader;
 class Table;
+
+struct Datum;
 
 using ChunkedArrayVector = std::vector<std::shared_ptr<ChunkedArray>>;
 using RecordBatchVector = std::vector<std::shared_ptr<RecordBatch>>;
@@ -250,6 +251,9 @@ struct DurationScalar;
 class ExtensionType;
 class ExtensionArray;
 struct ExtensionScalar;
+
+class Tensor;
+class SparseTensor;
 
 // ----------------------------------------------------------------------
 
@@ -485,7 +489,7 @@ ARROW_EXPORT
 std::shared_ptr<DataType> fixed_size_list(const std::shared_ptr<DataType>& value_type,
                                           int32_t list_size);
 /// \brief Return a Duration instance (naming use _type to avoid namespace conflict with
-/// built in time clases).
+/// built in time classes).
 std::shared_ptr<DataType> ARROW_EXPORT duration(TimeUnit::type unit);
 
 /// \brief Return a DayTimeIntervalType instance

@@ -17,7 +17,6 @@
 
 //! Defines kernel for length of a string array
 
-use crate::datatypes::ToByteSlice;
 use crate::{array::*, buffer::Buffer};
 use crate::{
     datatypes::DataType,
@@ -30,16 +29,20 @@ where
     OffsetSize: OffsetSizeTrait,
 {
     // note: offsets are stored as u8, but they can be interpreted as OffsetSize
-    let offsets = array.data_ref().clone().buffers()[0].clone();
+    let offsets = &array.data_ref().buffers()[0];
     // this is a 30% improvement over iterating over u8s and building OffsetSize, which
     // justifies the usage of `unsafe`.
     let slice: &[OffsetSize] =
         &unsafe { offsets.typed_data::<OffsetSize>() }[array.offset()..];
 
-    let lengths: Vec<OffsetSize> = slice
-        .windows(2)
-        .map(|offset| offset[1] - offset[0])
-        .collect();
+    let lengths = slice.windows(2).map(|offset| offset[1] - offset[0]);
+
+    // JUSTIFICATION
+    //  Benefit
+    //      ~60% speedup
+    //  Soundness
+    //      `values` is an iterator with a known size.
+    let buffer = unsafe { Buffer::from_trusted_len_iter(lengths) };
 
     let null_bit_buffer = array
         .data_ref()
@@ -53,7 +56,7 @@ where
         None,
         null_bit_buffer,
         0,
-        vec![Buffer::from(lengths.to_byte_slice())],
+        vec![buffer],
         vec![],
     );
     Ok(make_array(Arc::new(data)))
@@ -102,36 +105,30 @@ mod tests {
 
     #[test]
     fn test_string() -> Result<()> {
-        cases()
-            .into_iter()
-            .map(|(input, len, expected)| {
-                let array = StringArray::from(input);
-                let result = length(&array)?;
-                assert_eq!(len, result.len());
-                let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
-                expected.iter().enumerate().for_each(|(i, value)| {
-                    assert_eq!(*value, result.value(i));
-                });
-                Ok(())
-            })
-            .collect::<Result<()>>()
+        cases().into_iter().try_for_each(|(input, len, expected)| {
+            let array = StringArray::from(input);
+            let result = length(&array)?;
+            assert_eq!(len, result.len());
+            let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+            expected.iter().enumerate().for_each(|(i, value)| {
+                assert_eq!(*value, result.value(i));
+            });
+            Ok(())
+        })
     }
 
     #[test]
     fn test_large_string() -> Result<()> {
-        cases()
-            .into_iter()
-            .map(|(input, len, expected)| {
-                let array = LargeStringArray::from(input);
-                let result = length(&array)?;
-                assert_eq!(len, result.len());
-                let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
-                expected.iter().enumerate().for_each(|(i, value)| {
-                    assert_eq!(*value as i64, result.value(i));
-                });
-                Ok(())
-            })
-            .collect::<Result<()>>()
+        cases().into_iter().try_for_each(|(input, len, expected)| {
+            let array = LargeStringArray::from(input);
+            let result = length(&array)?;
+            assert_eq!(len, result.len());
+            let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
+            expected.iter().enumerate().for_each(|(i, value)| {
+                assert_eq!(*value as i64, result.value(i));
+            });
+            Ok(())
+        })
     }
 
     fn null_cases() -> Vec<(Vec<Option<&'static str>>, usize, Vec<Option<i32>>)> {
@@ -146,7 +143,7 @@ mod tests {
     fn null_string() -> Result<()> {
         null_cases()
             .into_iter()
-            .map(|(input, len, expected)| {
+            .try_for_each(|(input, len, expected)| {
                 let array = StringArray::from(input);
                 let result = length(&array)?;
                 assert_eq!(len, result.len());
@@ -156,14 +153,13 @@ mod tests {
                 assert_eq!(expected.data(), result.data());
                 Ok(())
             })
-            .collect::<Result<()>>()
     }
 
     #[test]
     fn null_large_string() -> Result<()> {
         null_cases()
             .into_iter()
-            .map(|(input, len, expected)| {
+            .try_for_each(|(input, len, expected)| {
                 let array = LargeStringArray::from(input);
                 let result = length(&array)?;
                 assert_eq!(len, result.len());
@@ -178,7 +174,6 @@ mod tests {
                 assert_eq!(expected.data(), result.data());
                 Ok(())
             })
-            .collect::<Result<()>>()
     }
 
     /// Tests that length is not valid for u64.

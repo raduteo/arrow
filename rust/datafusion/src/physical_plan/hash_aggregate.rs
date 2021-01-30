@@ -21,32 +21,43 @@ use std::any::Any;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures::stream::{Stream, StreamExt, TryStreamExt};
-use futures::FutureExt;
+use ahash::RandomState;
+use futures::{
+    stream::{Stream, StreamExt},
+    Future,
+};
 
 use crate::error::{DataFusionError, Result};
 use crate::physical_plan::{Accumulator, AggregateExpr};
 use crate::physical_plan::{Distribution, ExecutionPlan, Partitioning, PhysicalExpr};
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::error::Result as ArrowResult;
-use arrow::record_batch::RecordBatch;
+use arrow::array::BooleanArray;
+use arrow::{
+    array::{Array, UInt32Builder},
+    error::{ArrowError, Result as ArrowResult},
+};
 use arrow::{
     array::{
-        ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     },
     compute,
 };
+use arrow::{
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
+    record_batch::RecordBatch,
+};
+use hashbrown::HashMap;
+use ordered_float::OrderedFloat;
+use pin_project_lite::pin_project;
 
-use fnv::FnvHashMap;
+use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+use async_trait::async_trait;
 
 use super::{
-    common, expressions::Column, group_scalar::GroupByScalar, RecordBatchStream,
+    expressions::Column, group_scalar::GroupByScalar, RecordBatchStream,
     SendableRecordBatchStream,
 };
-
-use async_trait::async_trait;
 
 /// Hash aggregate modes
 #[derive(Debug, Copy, Clone)]
@@ -60,10 +71,15 @@ pub enum AggregateMode {
 /// Hash aggregate execution plan
 #[derive(Debug)]
 pub struct HashAggregateExec {
+    /// Aggregation mode (full, partial)
     mode: AggregateMode,
+    /// Grouping expressions
     group_expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
+    /// Aggregate expressions
     aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+    /// Input plan
     input: Arc<dyn ExecutionPlan>,
+    /// Schema after the aggregate is applied
     schema: SchemaRef,
 }
 
@@ -120,6 +136,26 @@ impl HashAggregateExec {
             schema,
         })
     }
+
+    /// Aggregation mode (full, partial)
+    pub fn mode(&self) -> &AggregateMode {
+        &self.mode
+    }
+
+    /// Grouping expressions
+    pub fn group_expr(&self) -> &[(Arc<dyn PhysicalExpr>, String)] {
+        &self.group_expr
+    }
+
+    /// Aggregate expressions
+    pub fn aggr_expr(&self) -> &[Arc<dyn AggregateExpr>] {
+        &self.aggr_expr
+    }
+
+    /// Input plan
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
 }
 
 #[async_trait]
@@ -162,7 +198,7 @@ impl ExecutionPlan for HashAggregateExec {
             )))
         } else {
             Ok(Box::pin(GroupedHashAggregateStream::new(
-                self.mode.clone(),
+                self.mode,
                 self.schema.clone(),
                 group_expr,
                 self.aggr_expr.clone(),
@@ -214,13 +250,13 @@ Example: average
 * Once all N record batches arrive, `merge` is performed, which builds a RecordBatch with N rows and 2 columns.
 * Finally, `get_value` returns an array with one entry computed from the state
 */
-struct GroupedHashAggregateStream {
-    mode: AggregateMode,
-    schema: SchemaRef,
-    group_expr: Vec<Arc<dyn PhysicalExpr>>,
-    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
-    input: SendableRecordBatchStream,
-    finished: bool,
+pin_project! {
+    struct GroupedHashAggregateStream {
+        schema: SchemaRef,
+        #[pin]
+        output: futures::channel::oneshot::Receiver<ArrowResult<RecordBatch>>,
+        finished: bool,
+    }
 }
 
 fn group_aggregate_batch(
@@ -242,46 +278,98 @@ fn group_aggregate_batch(
     // create vector large enough to hold the grouping key
     // this is an optimization to avoid allocating `key` on every row.
     // it will be overwritten on every iteration of the loop below
-    let mut key = Vec::with_capacity(group_values.len());
+    let mut group_by_values = Vec::with_capacity(group_values.len());
     for _ in 0..group_values.len() {
-        key.push(GroupByScalar::UInt32(0));
+        group_by_values.push(GroupByScalar::UInt32(0));
     }
+
+    let mut group_by_values = group_by_values.into_boxed_slice();
+
+    let mut key = Vec::with_capacity(group_values.len());
 
     // 1.1 construct the key from the group values
     // 1.2 construct the mapping key if it does not exist
     // 1.3 add the row' index to `indices`
+
+    // Make sure we can create the accumulators or otherwise return an error
+    create_accumulators(aggr_expr).map_err(DataFusionError::into_arrow_external_error)?;
+
+    // Keys received in this batch
+    let mut batch_keys = vec![];
+
     for row in 0..batch.num_rows() {
         // 1.1
         create_key(&group_values, row, &mut key)
             .map_err(DataFusionError::into_arrow_external_error)?;
 
-        match accumulators.get_mut(&key) {
-            // 1.2
-            None => {
-                let accumulator_set = create_accumulators(aggr_expr)
-                    .map_err(DataFusionError::into_arrow_external_error)?;
-
-                accumulators
-                    .insert(key.clone(), (accumulator_set, Box::new(vec![row as u32])));
-            }
+        accumulators
+            .raw_entry_mut()
+            .from_key(&key)
             // 1.3
-            Some((_, v)) => v.push(row as u32),
-        }
+            .and_modify(|_, (_, _, v)| {
+                if v.is_empty() {
+                    batch_keys.push(key.clone())
+                };
+                v.push(row as u32)
+            })
+            // 1.2
+            .or_insert_with(|| {
+                // We can safely unwrap here as we checked we can create an accumulator before
+                let accumulator_set = create_accumulators(aggr_expr).unwrap();
+                batch_keys.push(key.clone());
+                let _ = create_group_by_values(&group_values, row, &mut group_by_values);
+                (
+                    key.clone(),
+                    (group_by_values.clone(), accumulator_set, vec![row as u32]),
+                )
+            });
     }
 
-    // 2.1 for each key
+    // Collect all indices + offsets based on keys in this vec
+    let mut batch_indices: UInt32Builder = UInt32Builder::new(0);
+    let mut offsets = vec![0];
+    let mut offset_so_far = 0;
+    for key in batch_keys.iter() {
+        let (_, _, indices) = accumulators.get_mut(key).unwrap();
+        batch_indices.append_slice(&indices)?;
+        offset_so_far += indices.len();
+        offsets.push(offset_so_far);
+    }
+    let batch_indices = batch_indices.finish();
+
+    // `Take` all values based on indices into Arrays
+    let values: Vec<Vec<Arc<dyn Array>>> = aggr_input_values
+        .iter()
+        .map(|array| {
+            array
+                .iter()
+                .map(|array| {
+                    compute::take(
+                        array.as_ref(),
+                        &batch_indices,
+                        None, // None: no index check
+                    )
+                    .unwrap()
+                })
+                .collect()
+            // 2.3
+        })
+        .collect();
+
+    // 2.1 for each key in this batch
     // 2.2 for each aggregation
-    // 2.3 `take` from each of its arrays the keys' values
+    // 2.3 `slice` from each of its arrays the keys' values
     // 2.4 update / merge the accumulator with the values
     // 2.5 clear indices
-    accumulators
+    batch_keys
         .iter_mut()
-        // 2.1
-        .map(|(_, (accumulator_set, indices))| {
+        .zip(offsets.windows(2))
+        .try_for_each(|(key, offsets)| {
+            let (_, accumulator_set, indices) = accumulators.get_mut(key).unwrap();
             // 2.2
             accumulator_set
-                .into_iter()
-                .zip(&aggr_input_values)
+                .iter_mut()
+                .zip(values.iter())
                 .map(|(accumulator, aggr_array)| {
                     (
                         accumulator,
@@ -289,30 +377,147 @@ fn group_aggregate_batch(
                             .iter()
                             .map(|array| {
                                 // 2.3
-                                compute::take(
-                                    array,
-                                    &UInt32Array::from(*indices.clone()),
-                                    None, // None: no index check
-                                )
-                                .unwrap()
+                                array.slice(offsets[0], offsets[1] - offsets[0])
                             })
-                            .collect::<Vec<ArrayRef>>(),
+                            .collect(),
                     )
                 })
-                // 2.4
-                .map(|(accumulator, values)| match mode {
+                .try_for_each(|(accumulator, values)| match mode {
                     AggregateMode::Partial => accumulator.update_batch(&values),
                     AggregateMode::Final => {
                         // note: the aggregation here is over states, not values, thus the merge
                         accumulator.merge_batch(&values)
                     }
                 })
-                .collect::<Result<()>>()
                 // 2.5
-                .and(Ok(indices.clear()))
-        })
-        .collect::<Result<()>>()?;
+                .and({
+                    indices.clear();
+                    Ok(())
+                })
+        })?;
     Ok(accumulators)
+}
+
+/// Create a key `Vec<u8>` that is used as key for the hashmap
+pub(crate) fn create_key(
+    group_by_keys: &[ArrayRef],
+    row: usize,
+    vec: &mut Vec<u8>,
+) -> Result<()> {
+    vec.clear();
+    for col in group_by_keys {
+        match col.data_type() {
+            DataType::Boolean => {
+                let array = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                vec.extend_from_slice(&[array.value(row) as u8]);
+            }
+            DataType::Float32 => {
+                let array = col.as_any().downcast_ref::<Float32Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Float64 => {
+                let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::UInt8 => {
+                let array = col.as_any().downcast_ref::<UInt8Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::UInt16 => {
+                let array = col.as_any().downcast_ref::<UInt16Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::UInt32 => {
+                let array = col.as_any().downcast_ref::<UInt32Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::UInt64 => {
+                let array = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Int8 => {
+                let array = col.as_any().downcast_ref::<Int8Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Int16 => {
+                let array = col.as_any().downcast_ref::<Int16Array>().unwrap();
+                vec.extend(array.value(row).to_le_bytes().iter());
+            }
+            DataType::Int32 => {
+                let array = col.as_any().downcast_ref::<Int32Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Int64 => {
+                let array = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                vec.extend_from_slice(&array.value(row).to_le_bytes());
+            }
+            DataType::Utf8 => {
+                let array = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let value = array.value(row);
+                // store the size
+                vec.extend_from_slice(&value.len().to_le_bytes());
+                // store the string value
+                vec.extend_from_slice(value.as_bytes());
+            }
+            _ => {
+                // This is internal because we should have caught this before.
+                return Err(DataFusionError::Internal(format!(
+                    "Unsupported GROUP BY for {}",
+                    col.data_type(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn compute_grouped_hash_aggregate(
+    mode: AggregateMode,
+    schema: SchemaRef,
+    group_expr: Vec<Arc<dyn PhysicalExpr>>,
+    aggr_expr: Vec<Arc<dyn AggregateExpr>>,
+    mut input: SendableRecordBatchStream,
+) -> ArrowResult<RecordBatch> {
+    // the expressions to evaluate the batch, one vec of expressions per aggregation
+    let aggregate_expressions = aggregate_expressions(&aggr_expr, &mode)
+        .map_err(DataFusionError::into_arrow_external_error)?;
+
+    // mapping key -> (set of accumulators, indices of the key in the batch)
+    // * the indexes are updated at each row
+    // * the accumulators are updated at the end of each batch
+    // * the indexes are `clear`ed at the end of each batch
+    //let mut accumulators: Accumulators = FnvHashMap::default();
+
+    // iterate over all input batches and update the accumulators
+    let mut accumulators = Accumulators::default();
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        accumulators = group_aggregate_batch(
+            &mode,
+            &group_expr,
+            &aggr_expr,
+            batch,
+            accumulators,
+            &aggregate_expressions,
+        )
+        .map_err(DataFusionError::into_arrow_external_error)?;
+    }
+
+    create_batch_from_map(&mode, &accumulators, group_expr.len(), &schema)
 }
 
 impl GroupedHashAggregateStream {
@@ -324,81 +529,61 @@ impl GroupedHashAggregateStream {
         aggr_expr: Vec<Arc<dyn AggregateExpr>>,
         input: SendableRecordBatchStream,
     ) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+
+        let schema_clone = schema.clone();
+        tokio::spawn(async move {
+            let result = compute_grouped_hash_aggregate(
+                mode,
+                schema_clone,
+                group_expr,
+                aggr_expr,
+                input,
+            )
+            .await;
+            tx.send(result)
+        });
+
         GroupedHashAggregateStream {
-            mode,
             schema,
-            group_expr,
-            aggr_expr,
-            input,
+            output: rx,
             finished: false,
         }
     }
 }
 
 type AccumulatorSet = Vec<Box<dyn Accumulator>>;
-type Accumulators = FnvHashMap<Vec<GroupByScalar>, (AccumulatorSet, Box<Vec<u32>>)>;
+type Accumulators =
+    HashMap<Vec<u8>, (Box<[GroupByScalar]>, AccumulatorSet, Vec<u32>), RandomState>;
 
 impl Stream for GroupedHashAggregateStream {
     type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         if self.finished {
             return Poll::Ready(None);
         }
 
-        // return single batch
-        self.finished = true;
+        // is the output ready?
+        let this = self.project();
+        let output_poll = this.output.poll(cx);
 
-        let mode = self.mode.clone();
-        let group_expr = self.group_expr.clone();
-        let aggr_expr = self.aggr_expr.clone();
-        let schema = self.schema.clone();
+        match output_poll {
+            Poll::Ready(result) => {
+                *this.finished = true;
 
-        // the expressions to evaluate the batch, one vec of expressions per aggregation
-        let aggregate_expressions = match aggregate_expressions(&aggr_expr, &mode) {
-            Ok(e) => e,
-            Err(e) => {
-                return Poll::Ready(Some(Err(
-                    DataFusionError::into_arrow_external_error(e),
-                )))
+                // check for error in receiving channel and unwrap actual result
+                let result = match result {
+                    Err(e) => Err(ArrowError::ExternalError(Box::new(e))), // error receiving
+                    Ok(result) => result,
+                };
+                Poll::Ready(Some(result))
             }
-        };
-
-        // mapping key -> (set of accumulators, indices of the key in the batch)
-        // * the indexes are updated at each row
-        // * the accumulators are updated at the end of each batch
-        // * the indexes are `clear`ed at the end of each batch
-        //let mut accumulators: Accumulators = FnvHashMap::default();
-
-        // iterate over all input batches and update the accumulators
-        let future = self.input.as_mut().try_fold(
-            Accumulators::default(),
-            |accumulators, batch| async {
-                group_aggregate_batch(
-                    &mode,
-                    &group_expr,
-                    &aggr_expr,
-                    batch,
-                    accumulators,
-                    &aggregate_expressions,
-                )
-                .map_err(DataFusionError::into_arrow_external_error)
-            },
-        );
-
-        let future = future.map(|maybe_accumulators| {
-            maybe_accumulators.map(|accumulators| {
-                create_batch_from_map(&mode, &accumulators, group_expr.len(), &schema)
-            })?
-        });
-
-        // send the stream to the heap, so that it outlives this function.
-        let mut combined = Box::pin(future.into_stream());
-
-        combined.poll_next_unpin(cx)
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -415,6 +600,7 @@ fn evaluate(
 ) -> Result<Vec<ArrayRef>> {
     expr.iter()
         .map(|expr| expr.evaluate(&batch))
+        .map(|r| r.map(|v| v.into_array(batch.num_rows())))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -462,12 +648,41 @@ fn aggregate_expressions(
     }
 }
 
-struct HashAggregateStream {
+pin_project! {
+    struct HashAggregateStream {
+        schema: SchemaRef,
+        #[pin]
+        output: futures::channel::oneshot::Receiver<ArrowResult<RecordBatch>>,
+        finished: bool,
+    }
+}
+
+async fn compute_hash_aggregate(
     mode: AggregateMode,
     schema: SchemaRef,
     aggr_expr: Vec<Arc<dyn AggregateExpr>>,
-    input: SendableRecordBatchStream,
-    finished: bool,
+    mut input: SendableRecordBatchStream,
+) -> ArrowResult<RecordBatch> {
+    let mut accumulators = create_accumulators(&aggr_expr)
+        .map_err(DataFusionError::into_arrow_external_error)?;
+
+    let expressions = aggregate_expressions(&aggr_expr, &mode)
+        .map_err(DataFusionError::into_arrow_external_error)?;
+
+    let expressions = Arc::new(expressions);
+
+    // 1 for each batch, update / merge accumulators with the expressions' values
+    // future is ready when all batches are computed
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        accumulators = aggregate_batch(&mode, &batch, accumulators, &expressions)
+            .map_err(DataFusionError::into_arrow_external_error)?;
+    }
+
+    // 2. convert values to a record batch
+    finalize_aggregation(&accumulators, &mode)
+        .map(|columns| RecordBatch::try_new(schema.clone(), columns))
+        .map_err(DataFusionError::into_arrow_external_error)?
 }
 
 impl HashAggregateStream {
@@ -478,11 +693,18 @@ impl HashAggregateStream {
         aggr_expr: Vec<Arc<dyn AggregateExpr>>,
         input: SendableRecordBatchStream,
     ) -> Self {
+        let (tx, rx) = futures::channel::oneshot::channel();
+
+        let schema_clone = schema.clone();
+        tokio::spawn(async move {
+            let result =
+                compute_hash_aggregate(mode, schema_clone, aggr_expr, input).await;
+            tx.send(result)
+        });
+
         HashAggregateStream {
-            mode,
             schema,
-            aggr_expr,
-            input,
+            output: rx,
             finished: false,
         }
     }
@@ -507,6 +729,7 @@ fn aggregate_batch(
             let values = &expr
                 .iter()
                 .map(|e| e.evaluate(batch))
+                .map(|r| r.map(|v| v.into_array(batch.num_rows())))
                 .collect::<Result<Vec<_>>>()?;
 
             // 1.3
@@ -527,65 +750,31 @@ impl Stream for HashAggregateStream {
     type Item = ArrowResult<RecordBatch>;
 
     fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         if self.finished {
             return Poll::Ready(None);
         }
 
-        // return single batch
-        self.finished = true;
+        // is the output ready?
+        let this = self.project();
+        let output_poll = this.output.poll(cx);
 
-        let accumulators = match create_accumulators(&self.aggr_expr) {
-            Ok(e) => e,
-            Err(e) => {
-                return Poll::Ready(Some(Err(
-                    DataFusionError::into_arrow_external_error(e),
-                )))
+        match output_poll {
+            Poll::Ready(result) => {
+                *this.finished = true;
+
+                // check for error in receiving channel and unwrap actual result
+                let result = match result {
+                    Err(e) => Err(ArrowError::ExternalError(Box::new(e))), // error receiving
+                    Ok(result) => result,
+                };
+
+                Poll::Ready(Some(result))
             }
-        };
-
-        let expressions = match aggregate_expressions(&self.aggr_expr, &self.mode) {
-            Ok(e) => e,
-            Err(e) => {
-                return Poll::Ready(Some(Err(
-                    DataFusionError::into_arrow_external_error(e),
-                )))
-            }
-        };
-        let expressions = Arc::new(expressions);
-
-        let mode = self.mode;
-        let schema = self.schema();
-
-        // 1 for each batch, update / merge accumulators with the expressions' values
-        // future is ready when all batches are computed
-        let future = self
-            .input
-            .as_mut()
-            .try_fold(
-                // pass the expressions on every fold to handle closures' mutability
-                (accumulators, expressions),
-                |(acc, expr), batch| async move {
-                    aggregate_batch(&mode, &batch, acc, &expr)
-                        .map_err(DataFusionError::into_arrow_external_error)
-                        .map(|agg| (agg, expr))
-                },
-            )
-            // pick the accumulators (disregard the expressions)
-            .map(|e| e.map(|e| e.0));
-
-        let future = future.map(|maybe_accumulators| {
-            maybe_accumulators.map(|accumulators| {
-                // 2. convert values to a record batch
-                finalize_aggregation(&accumulators, &mode)
-                    .map_err(DataFusionError::into_arrow_external_error)
-                    .and_then(|columns| RecordBatch::try_new(schema.clone(), columns))
-            })?
-        });
-
-        Box::pin(future.into_stream()).poll_next_unpin(cx)
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -600,7 +789,10 @@ impl RecordBatchStream for HashAggregateStream {
 fn concatenate(arrays: Vec<Vec<ArrayRef>>) -> ArrowResult<Vec<ArrayRef>> {
     (0..arrays[0].len())
         .map(|column| {
-            let array_list = arrays.iter().map(|a| a[column].clone()).collect::<Vec<_>>();
+            let array_list = arrays
+                .iter()
+                .map(|a| a[column].as_ref())
+                .collect::<Vec<_>>();
             compute::concat(&array_list)
         })
         .collect::<ArrowResult<Vec<_>>>()
@@ -620,10 +812,18 @@ fn create_batch_from_map(
     // 5. concatenate the arrays over the second index [j] into a single vec<ArrayRef>.
     let arrays = accumulators
         .iter()
-        .map(|(k, (accumulator_set, _))| {
+        .map(|(_, (group_by_values, accumulator_set, _))| {
             // 2.
             let mut groups = (0..num_group_expr)
-                .map(|i| match &k[i] {
+                .map(|i| match &group_by_values[i] {
+                    GroupByScalar::Float32(n) => {
+                        Arc::new(Float32Array::from(vec![(*n).into()] as Vec<f32>))
+                            as ArrayRef
+                    }
+                    GroupByScalar::Float64(n) => {
+                        Arc::new(Float64Array::from(vec![(*n).into()] as Vec<f64>))
+                            as ArrayRef
+                    }
                     GroupByScalar::Int8(n) => {
                         Arc::new(Int8Array::from(vec![*n])) as ArrayRef
                     }
@@ -634,7 +834,16 @@ fn create_batch_from_map(
                     GroupByScalar::UInt16(n) => Arc::new(UInt16Array::from(vec![*n])),
                     GroupByScalar::UInt32(n) => Arc::new(UInt32Array::from(vec![*n])),
                     GroupByScalar::UInt64(n) => Arc::new(UInt64Array::from(vec![*n])),
-                    GroupByScalar::Utf8(str) => Arc::new(StringArray::from(vec![&**str])),
+                    GroupByScalar::Utf8(str) => {
+                        Arc::new(StringArray::from(vec![&***str]))
+                    }
+                    GroupByScalar::Boolean(b) => Arc::new(BooleanArray::from(vec![*b])),
+                    GroupByScalar::TimeMicrosecond(n) => {
+                        Arc::new(TimestampMicrosecondArray::from(vec![*n]))
+                    }
+                    GroupByScalar::TimeNanosecond(n) => {
+                        Arc::new(TimestampNanosecondArray::from_vec(vec![*n], None))
+                    }
                 })
                 .collect::<Vec<ArrayRef>>();
 
@@ -649,12 +858,12 @@ fn create_batch_from_map(
         // 4.
         .collect::<ArrowResult<Vec<Vec<ArrayRef>>>>()?;
 
-    let batch = if arrays.len() != 0 {
+    let batch = if !arrays.is_empty() {
         // 5.
         let columns = concatenate(arrays)?;
         RecordBatch::try_new(Arc::new(output_schema.to_owned()), columns)?
     } else {
-        common::create_batch_empty(output_schema)?
+        RecordBatch::new_empty(Arc::new(output_schema.to_owned()))
     };
     Ok(batch)
 }
@@ -681,8 +890,8 @@ fn finalize_aggregation(
                 .iter()
                 .map(|accumulator| accumulator.state())
                 .map(|value| {
-                    value.and_then(|e| {
-                        Ok(e.iter().map(|v| v.to_array()).collect::<Vec<ArrayRef>>())
+                    value.map(|e| {
+                        e.iter().map(|v| v.to_array()).collect::<Vec<ArrayRef>>()
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -692,21 +901,29 @@ fn finalize_aggregation(
             // merge the state to the final value
             accumulators
                 .iter()
-                .map(|accumulator| accumulator.evaluate().and_then(|v| Ok(v.to_array())))
+                .map(|accumulator| accumulator.evaluate().map(|v| v.to_array()))
                 .collect::<Result<Vec<ArrayRef>>>()
         }
     }
 }
 
-/// Create a Vec<GroupByScalar> that can be used as a map key
-fn create_key(
+/// Create a Box<[GroupByScalar]> for the group by values
+pub(crate) fn create_group_by_values(
     group_by_keys: &[ArrayRef],
     row: usize,
-    vec: &mut Vec<GroupByScalar>,
+    vec: &mut Box<[GroupByScalar]>,
 ) -> Result<()> {
     for i in 0..group_by_keys.len() {
         let col = &group_by_keys[i];
         match col.data_type() {
+            DataType::Float32 => {
+                let array = col.as_any().downcast_ref::<Float32Array>().unwrap();
+                vec[i] = GroupByScalar::Float32(OrderedFloat::from(array.value(row)))
+            }
+            DataType::Float64 => {
+                let array = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                vec[i] = GroupByScalar::Float64(OrderedFloat::from(array.value(row)))
+            }
             DataType::UInt8 => {
                 let array = col.as_any().downcast_ref::<UInt8Array>().unwrap();
                 vec[i] = GroupByScalar::UInt8(array.value(row))
@@ -741,13 +958,32 @@ fn create_key(
             }
             DataType::Utf8 => {
                 let array = col.as_any().downcast_ref::<StringArray>().unwrap();
-                vec[i] = GroupByScalar::Utf8(String::from(array.value(row)))
+                vec[i] = GroupByScalar::Utf8(Box::new(array.value(row).into()))
+            }
+            DataType::Boolean => {
+                let array = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+                vec[i] = GroupByScalar::Boolean(array.value(row))
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                vec[i] = GroupByScalar::TimeMicrosecond(array.value(row))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+                let array = col
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                vec[i] = GroupByScalar::TimeNanosecond(array.value(row))
             }
             _ => {
                 // This is internal because we should have caught this before.
-                return Err(DataFusionError::Internal(
-                    "Unsupported GROUP BY data type".to_string(),
-                ));
+                return Err(DataFusionError::Internal(format!(
+                    "Unsupported GROUP BY for {}",
+                    col.data_type(),
+                )));
             }
         }
     }
@@ -761,10 +997,12 @@ mod tests {
 
     use super::*;
     use crate::physical_plan::expressions::{col, Avg};
-    use crate::physical_plan::merge::MergeExec;
-    use crate::physical_plan::{common, memory::MemoryExec};
+    use crate::{assert_batches_sorted_eq, physical_plan::common};
 
-    fn some_data() -> ArrowResult<(Arc<Schema>, Vec<RecordBatch>)> {
+    use crate::physical_plan::merge::MergeExec;
+
+    /// some mock data to aggregates
+    fn some_data() -> (Arc<Schema>, Vec<RecordBatch>) {
         // define a schema.
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::UInt32, false),
@@ -772,7 +1010,7 @@ mod tests {
         ]));
 
         // define data.
-        Ok((
+        (
             schema.clone(),
             vec![
                 RecordBatch::try_new(
@@ -781,26 +1019,22 @@ mod tests {
                         Arc::new(UInt32Array::from(vec![2, 3, 4, 4])),
                         Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
                     ],
-                )?,
+                )
+                .unwrap(),
                 RecordBatch::try_new(
-                    schema.clone(),
+                    schema,
                     vec![
                         Arc::new(UInt32Array::from(vec![2, 3, 3, 4])),
                         Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
                     ],
-                )?,
+                )
+                .unwrap(),
             ],
-        ))
+        )
     }
 
-    #[tokio::test]
-    async fn aggregate() -> Result<()> {
-        let (schema, batches) = some_data().unwrap();
-
-        let input: Arc<dyn ExecutionPlan> = Arc::new(
-            MemoryExec::try_new(&vec![batches.clone(), batches], schema, None).unwrap(),
-        );
-
+    /// build the aggregates on the data from some_data() and check the results
+    async fn check_aggregates(input: Arc<dyn ExecutionPlan>) -> Result<()> {
         let groups: Vec<(Arc<dyn PhysicalExpr>, String)> =
             vec![(col("a"), "a".to_string())];
 
@@ -819,26 +1053,16 @@ mod tests {
 
         let result = common::collect(partial_aggregate.execute(0).await?).await?;
 
-        let keys = result[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        assert_eq!(*keys, UInt32Array::from(vec![2, 3, 4]));
-
-        let ns = result[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        assert_eq!(*ns, UInt64Array::from(vec![2, 3, 3]));
-
-        let sums = result[0]
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert_eq!(*sums, Float64Array::from(vec![2.0, 7.0, 11.0]));
+        let expected = vec![
+            "+---+---------------+-------------+",
+            "| a | AVG(b)[count] | AVG(b)[sum] |",
+            "+---+---------------+-------------+",
+            "| 2 | 2             | 2           |",
+            "| 3 | 3             | 7           |",
+            "| 4 | 3             | 11          |",
+            "+---+---------------+-------------+",
+        ];
+        assert_batches_sorted_eq!(expected, &result);
 
         let merge = Arc::new(MergeExec::new(partial_aggregate));
 
@@ -863,27 +1087,121 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 3);
 
-        let a = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let b = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
+        let expected = vec![
+            "+---+--------------------+",
+            "| a | AVG(b)             |",
+            "+---+--------------------+",
+            "| 2 | 1                  |",
+            "| 3 | 2.3333333333333335 |", // 3, (2 + 3 + 2) / 3
+            "| 4 | 3.6666666666666665 |", // 4, (3 + 4 + 4) / 3
+            "+---+--------------------+",
+        ];
 
-        assert_eq!(*a, UInt32Array::from(vec![2, 3, 4]));
-        assert_eq!(
-            *b,
-            Float64Array::from(vec![
-                1.0,
-                (2.0 + 3.0 + 2.0) / 3.0,
-                (3.0 + 4.0 + 4.0) / 3.0
-            ])
-        );
-
+        assert_batches_sorted_eq!(&expected, &result);
         Ok(())
+    }
+
+    /// Define a test source that can yield back to runtime before returning its first item ///
+
+    #[derive(Debug)]
+    struct TestYieldingExec {
+        /// True if this exec should yield back to runtime the first time it is polled
+        pub yield_first: bool,
+    }
+
+    #[async_trait]
+    impl ExecutionPlan for TestYieldingExec {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            some_data().0
+        }
+
+        fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn output_partitioning(&self) -> Partitioning {
+            Partitioning::UnknownPartitioning(1)
+        }
+
+        fn with_new_children(
+            &self,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::Internal(format!(
+                "Children cannot be replaced in {:?}",
+                self
+            )))
+        }
+
+        async fn execute(&self, _partition: usize) -> Result<SendableRecordBatchStream> {
+            let stream;
+            if self.yield_first {
+                stream = TestYieldingStream::New;
+            } else {
+                stream = TestYieldingStream::Yielded;
+            }
+            Ok(Box::pin(stream))
+        }
+    }
+
+    /// A stream using the demo data. If inited as new, it will first yield to runtime before returning records
+    enum TestYieldingStream {
+        New,
+        Yielded,
+        ReturnedBatch1,
+        ReturnedBatch2,
+    }
+
+    impl Stream for TestYieldingStream {
+        type Item = ArrowResult<RecordBatch>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            match &*self {
+                TestYieldingStream::New => {
+                    *(self.as_mut()) = TestYieldingStream::Yielded;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                TestYieldingStream::Yielded => {
+                    *(self.as_mut()) = TestYieldingStream::ReturnedBatch1;
+                    Poll::Ready(Some(Ok(some_data().1[0].clone())))
+                }
+                TestYieldingStream::ReturnedBatch1 => {
+                    *(self.as_mut()) = TestYieldingStream::ReturnedBatch2;
+                    Poll::Ready(Some(Ok(some_data().1[1].clone())))
+                }
+                TestYieldingStream::ReturnedBatch2 => Poll::Ready(None),
+            }
+        }
+    }
+
+    impl RecordBatchStream for TestYieldingStream {
+        fn schema(&self) -> SchemaRef {
+            some_data().0
+        }
+    }
+
+    //// Tests ////
+
+    #[tokio::test]
+    async fn aggregate_source_not_yielding() -> Result<()> {
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestYieldingExec { yield_first: false });
+
+        check_aggregates(input).await
+    }
+
+    #[tokio::test]
+    async fn aggregate_source_with_yielding() -> Result<()> {
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestYieldingExec { yield_first: true });
+
+        check_aggregates(input).await
     }
 }

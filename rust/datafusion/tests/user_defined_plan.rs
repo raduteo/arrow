@@ -85,13 +85,14 @@ use std::task::{Context, Poll};
 use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
+use datafusion::logical_plan::DFSchemaRef;
 
 /// Execute the specified sql and return the resulting record batches
 /// pretty printed as a String.
 async fn exec_sql(ctx: &mut ExecutionContext, sql: &str) -> Result<String> {
     let df = ctx.sql(sql)?;
     let batches = df.collect().await?;
-    pretty_format_batches(&batches).map_err(|e| DataFusionError::ArrowError(e))
+    pretty_format_batches(&batches).map_err(DataFusionError::ArrowError)
 }
 
 /// Create a test table.
@@ -246,7 +247,7 @@ impl OptimizerRule for TopKOptimizerRule {
                     *verbose,
                     &*plan,
                     stringified_plans,
-                    &*schema,
+                    &schema.as_ref().to_owned().into(),
                 )
             }
             _ => {}
@@ -288,7 +289,7 @@ impl UserDefinedLogicalNode for TopKPlanNode {
     }
 
     /// Schema for TopK is the same as the input
-    fn schema(&self) -> &SchemaRef {
+    fn schema(&self) -> &DFSchemaRef {
         self.input.schema()
     }
 
@@ -494,7 +495,7 @@ impl Stream for TopKReader {
 
         // take this as immutable
         let k = self.k;
-        let schema = self.schema().clone();
+        let schema = self.schema();
 
         let top_values = self
             .input
